@@ -18,7 +18,7 @@ except Exception:
 import gradio as gr
 
 try:
-    from orchestrator_updated import PolymerOrchestrator, OrchestratorConfig
+    from orchestrator import PolymerOrchestrator, OrchestratorConfig
 except Exception as e:
     raise ImportError(
         "Could not import PolymerOrchestrator from orchestrator_updated.py. "
@@ -77,7 +77,6 @@ DEFAULT_TARGET_BY_PROPERTY = {
     "glass transition": 60.0,          # °C (example placeholder)
     "density": 1.20,                   # g/cm^3 (example placeholder)
     "melting": 150.0,                  # °C (example placeholder)
-    "specific volume": 0.85,           # cm^3/g (example placeholder)
     "thermal decomposition": 350.0,    # °C (example placeholder)
 }
 
@@ -229,16 +228,12 @@ def _infer_property_from_questions(q: str) -> Optional[str]:
             return "density"
         if "melting" in cand or re.search(r"\btm\b", cand):
             return "melting"
-        if "specific" in cand or re.search(r"\bsv\b", cand):
-            return "specific volume"
         if "decomp" in cand or "decomposition" in cand or re.search(r"\btd\b", cand):
             return "thermal decomposition"
 
     # Token-based inference
     if "thermal decomposition" in s or "decomposition temperature" in s or "decomposition" in s or re.search(r"\btd\b", s):
         return "thermal decomposition"
-    if "specific volume" in s or re.search(r"\bsv\b", s):
-        return "specific volume"
     if "glass transition" in s or "glass-transition" in s or re.search(r"\btg\b", s):
         return "glass transition"
     if "melting" in s or "melt temperature" in s or re.search(r"\btm\b", s):
@@ -253,7 +248,7 @@ def _infer_target_value_from_questions(q: str, prop: Optional[str]) -> Optional[
     """
     Infer numeric target_value from free-text questions.
     - supports explicit: target_value=..., target: ..., tgt ...
-    - supports property-attached: Tg 60, density 1.25, Td=380, sv 0.85, Tm 180
+    - supports property-attached: Tg 60, density 1.25, Td=380, Tm 180
     """
     sl = (q or "").lower()
 
@@ -274,8 +269,6 @@ def _infer_target_value_from_questions(q: str, prop: Optional[str]) -> Optional[
         prop_patterns = [rf"\b(density|rho)\b\s*[:=]?\s*({_NUM_RE})"]
     elif prop == "melting":
         prop_patterns = [rf"\b(tm|melting)\b\s*[:=]?\s*({_NUM_RE})"]
-    elif prop == "specific volume":
-        prop_patterns = [rf"\b(specific\s*volume|sv)\b\s*[:=]?\s*({_NUM_RE})"]
     elif prop == "thermal decomposition":
         prop_patterns = [rf"\b(td|thermal\s*decomposition|decomposition)\b\s*[:=]?\s*({_NUM_RE})"]
 
@@ -295,8 +288,6 @@ def _infer_target_value_from_questions(q: str, prop: Optional[str]) -> Optional[
         tokens = ["density", "rho"]
     elif prop == "melting":
         tokens = ["tm", "melting"]
-    elif prop == "specific volume":
-        tokens = ["specific volume", "sv"]
     elif prop == "thermal decomposition":
         tokens = ["td", "thermal decomposition", "decomposition"]
 
@@ -1043,10 +1034,10 @@ def run_agent(state: Dict[str, Any], questions: str) -> Tuple[str, List[str]]:
 
     # Artifacts
     imgs, extras = _maybe_add_artifacts(
-    orch,
-    report,
-    seed_psmiles_fallback=seed_psmiles,
-    property_name_fallback=property_name,
+        orch,
+        report,
+        seed_psmiles_fallback=seed_psmiles,
+        property_name_fallback=property_name,
     )
     ctx.update(extras)
 
@@ -1331,7 +1322,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Accordion("Property Prediction", open=False):
                     prop = gr.Dropdown(
                         label="Property",
-                        choices=["density", "glass transition", "melting", "specific volume", "thermal decomposition"],
+                        choices=["density", "glass transition", "melting", "thermal decomposition"],
                         value="glass transition",
                     )
                     psm_pred = gr.Textbox(label="Optional pSMILES (if not using previous extraction)")
@@ -1342,7 +1333,7 @@ def build_ui() -> gr.Blocks:
                 with gr.Accordion("Polymer Generation (inverse design)", open=False):
                     prop_g = gr.Dropdown(
                         label="Property (select generator)",
-                        choices=["density", "glass transition", "melting", "specific volume", "thermal decomposition"],
+                        choices=["density", "glass transition", "melting", "thermal decomposition"],
                         value="glass transition",
                     )
                     tgt = gr.Number(label="target_value (required)", value=60.0, precision=4)
@@ -1374,7 +1365,7 @@ def build_ui() -> gr.Blocks:
                     psm_expl = gr.Textbox(label="pSMILES")
                     prop_expl = gr.Dropdown(
                         label="Property (for attribution)",
-                        choices=["density", "glass transition", "melting", "specific volume", "thermal decomposition"],
+                        choices=["density", "glass transition", "melting", "thermal decomposition"],
                         value="glass transition",
                     )
                     btn_expl = gr.Button("Explain", variant="primary")
