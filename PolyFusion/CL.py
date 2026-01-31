@@ -788,7 +788,6 @@ class MultimodalContrastiveModel(nn.Module):
 def mask_batch_for_modality(batch: dict, modality: str, tokenizer, p_mask: float = P_MASK) -> dict:
     """
     Apply BERT-style masking to the selected modality and attach `labels`.
-    Other modalities are passed through unchanged (but cloned where mutated).
     """
     b = {}
 
