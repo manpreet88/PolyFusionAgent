@@ -1,4 +1,3 @@
-# DeBERTav2.py
 """
 DeBERTaV2 masked language modeling pretraining for polymer SMILES (PSMILES).
 """
