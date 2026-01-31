@@ -28,7 +28,7 @@ except Exception as e:
 
 
 # =============================================================================
-# DOI NORMALIZATION HELPERS (UI layer must match orchestrator behavior)
+# DOI NORMALIZATION HELPERS
 # =============================================================================
 _DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$", re.IGNORECASE)
 
@@ -47,7 +47,7 @@ def doi_to_url(doi: str) -> str:
     return f"https://doi.org/{doi}"
 
 # -----------------------------------------------------------------------------
-# Console defaults (no UI controls for these)
+# Console defaults 
 # -----------------------------------------------------------------------------
 DEFAULT_CASE_BRIEF = (
     "We are developing a polymer film for high-barrier flexible packaging (food-contact). "
@@ -81,7 +81,7 @@ DEFAULT_TARGET_BY_PROPERTY = {
 }
 
 # -----------------------------------------------------------------------------
-# NEW: Run instructions bubble (shown on load and retained)
+# Run instructions bubble
 # -----------------------------------------------------------------------------
 RUN_INSTRUCTIONS_MD = (
     "### How to run PolyAgent (one-time setup)\n"
@@ -168,11 +168,6 @@ def _normalize_seed_inputs_for_display(obj: Any) -> Any:
 
     return obj
 
-
-# -----------------------------------------------------------------------------
-# Markdown safety: keep polymer endpoint token "[*]" from being rendered as "[]"
-# -----------------------------------------------------------------------------
-# Markdown safety: keep polymer endpoint token "[*]" from being rendered as "[]"
 _ENDPOINT_TOKEN_RE = re.compile(r"\[\*\]")
 
 def _escape_endpoint_tokens_for_markdown(text: str) -> str:
@@ -205,10 +200,9 @@ def _escape_endpoint_tokens_for_markdown(text: str) -> str:
     return "".join(out_parts)
 
 # -----------------------------------------------------------------------------
-# NEW: Auto-detect property / target_value / seed from Questions (NO GUI CHANGES)
+# Auto-detect property / target_value / seed from Questions 
 # -----------------------------------------------------------------------------
 _NUM_RE = r"[-+]?\d+(?:\.\d+)?"
-
 
 def _infer_property_from_questions(q: str) -> Optional[str]:
     """
@@ -242,7 +236,6 @@ def _infer_property_from_questions(q: str) -> Optional[str]:
         return "density"
 
     return None
-
 
 def _infer_target_value_from_questions(q: str, prop: Optional[str]) -> Optional[float]:
     """
@@ -338,7 +331,7 @@ def _infer_seed_psmiles_from_questions(q: str) -> Optional[str]:
     if not text:
         return None
 
-    # 1) Prefer code block content (first non-empty line)
+    # 1) Prefer code block content 
     code_blocks = re.findall(r"```(?:\w+)?\s*([\s\S]*?)```", text)
     for block in code_blocks:
         for line in (block or "").splitlines():
@@ -356,10 +349,6 @@ def _infer_seed_psmiles_from_questions(q: str) -> Optional[str]:
 
     return None
 
-
-# -----------------------------------------------------------------------------
-# Domain normalization: show ROOT domain like nature.com, springer.com, etc.
-# -----------------------------------------------------------------------------
 _SECOND_LEVEL_TLDS = {
     "co.uk",
     "ac.uk",
@@ -399,7 +388,6 @@ def _root_domain(netloc: str) -> str:
         if ".".join(parts[-2:]) in _SECOND_LEVEL_TLDS:
             return last3
     return last2
-
 
 def _url_to_domain(url: str) -> Optional[str]:
     if not isinstance(url, str) or not url.strip():
@@ -524,7 +512,7 @@ def ensure_orch(state: Dict[str, Any]) -> Tuple[PolymerOrchestrator, Dict[str, A
 
 
 # -----------------------------------------------------------------------------
-# NEW: extract tool output so the PLAN (execute_plan) drives the final report
+# Extract tool output so the PLAN drives the final report
 # -----------------------------------------------------------------------------
 def _extract_tool_output(exec_res: Dict[str, Any], tool_name: str) -> Optional[Any]:
     """
@@ -670,7 +658,7 @@ def _maybe_add_artifacts(
     except Exception as e:
         extras["gen_grid_error"] = str(e)
 
-    # Molecule render (seed) (unchanged but you may also want fallback)
+    # Polymer render (seed)
     try:
         seed_psmiles = ((report.get("summary", {}) or {}).get("property_prediction", {}) or {}).get("psmiles")
         if not seed_psmiles:
@@ -683,7 +671,7 @@ def _maybe_add_artifacts(
     except Exception as e:
         extras["mol_render_error"] = str(e)
 
-    # Explainability heatmap (NOW ALWAYS ATTEMPTED WHEN WE HAVE ANY pSMILES)
+    # Explainability heatmap
     try:
         summary = report.get("summary", {}) or {}
         tool_outputs = report.get("tool_outputs", {}) or {}
@@ -756,7 +744,6 @@ def _collect_citations(report: Dict[str, Any]) -> List[Dict[str, Any]]:
             if isinstance(s, dict):
                 sources.append(s)
 
-    # fallback walk
     if not sources:
         def walk(node: Any):
             if isinstance(node, dict):
@@ -809,7 +796,6 @@ def _collect_citations(report: Dict[str, Any]) -> List[Dict[str, Any]]:
         title = s.get("title") or "Untitled"
 
         dedup[key] = {
-            # Keep key name "domain" for UI compatibility, but it now holds the DOI URL / URL text requirement.
             "domain": cite_url,
             "title": title,
             "url": cite_url,
@@ -937,12 +923,12 @@ def _assign_tool_tags(plan: Dict[str, Any], exec_res: Dict[str, Any], report: Di
 
 
 # -----------------------------------------------------------------------------
-# PolyAgent Console: corrected run (plan drives tools; report comes from execute_plan)
+# PolyAgent Console
 # -----------------------------------------------------------------------------
 def run_agent(state: Dict[str, Any], questions: str) -> Tuple[str, List[str]]:
     orch, ctx = ensure_orch(state)
 
-    # ---------- AUTO-DETECTION (NO GUI CHANGES) ----------
+    # ---------- AUTO-DETECTION ----------
     qtxt = questions or ""
 
     inferred_prop = _infer_property_from_questions(qtxt) or DEFAULT_PROPERTY_NAME
@@ -1028,7 +1014,7 @@ def run_agent(state: Dict[str, Any], questions: str) -> Tuple[str, List[str]]:
     # Tool tags: ALWAYS [T]
     _assign_tool_tags(plan=plan, exec_res=exec_res, report=report)
 
-    # Normalize seed-related pSMILES for display only
+    # Normalize seed-related PSMILES for display only
     report = _normalize_seed_inputs_for_display(report)
     ctx["last_report"] = report
 
@@ -1069,7 +1055,7 @@ def run_agent(state: Dict[str, Any], questions: str) -> Tuple[str, List[str]]:
     return final_md, imgs
 
 
-# ----------------------------- Advanced Tools (optional tab) ----------------------------- #
+# ----------------------------- Advanced Tools ----------------------------- #
 def tool_data_extraction(state: Dict[str, Any], psmiles: str) -> Tuple[str, List[str]]:
     orch, ctx = ensure_orch(state)
     psmiles = _convert_at_to_star(psmiles)
