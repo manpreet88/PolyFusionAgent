@@ -1590,12 +1590,13 @@ class PolymerOrchestrator:
     def _ensure_cl_encoder(self):
         if self._cl_encoder is None:
             try:
-                from cl_models import (
-                    GineEncoder, NodeSchNetWrapper, FingerprintEncoder,
-                    PSMILESDebertaEncoder, MultimodalContrastiveModel, build_psmiles_tokenizer
-                )
+                from PolyFusion.GINE import GineEncoder
+                from PolyFusion.SchNet import NodeSchNetWrapper
+                from PolyFusion.Transformer import PooledFingerprintEncoder as FingerprintEncoder
+                from PolyFusion.DeBERTav2 import PSMILESDebertaEncoder, build_psmiles_tokenizer
+                from PolyFusion.CL import MultimodalContrastiveModel
             except Exception:
-                raise RuntimeError("cl_models not available in python path")
+                raise RuntimeError("Modules not available in python path")
 
             if self._psmiles_tokenizer is None:
                 self._psmiles_tokenizer = build_psmiles_tokenizer()
@@ -1707,7 +1708,6 @@ class PolymerOrchestrator:
         # psmiles tokenization for psmiles encoder
         if self._psmiles_tokenizer is None:
             try:
-                from cl_models import build_psmiles_tokenizer
                 self._psmiles_tokenizer = build_psmiles_tokenizer()
             except Exception:
                 self._psmiles_tokenizer = None
