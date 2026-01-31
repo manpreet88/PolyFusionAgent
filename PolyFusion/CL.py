@@ -22,19 +22,14 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
-# PyG building blocks
-try:
-    from torch_geometric.nn import GINEConv
-    from torch_geometric.nn.models import SchNet as PyGSchNet
-    from torch_geometric.nn import radius_graph
-except Exception as e:
-    # we keep imports guarded — if these fail, user will get a clear error later
-    GINEConv = None
-    PyGSchNet = None
-    radius_graph = None
+# Shared model utilities
+from GINE import GineEncoder, match_edge_attr_to_index, safe_get
+from SchNet import NodeSchNetWrapper
+from Transformer import PooledFingerprintEncoder as FingerprintEncoder
+from DeBERTav2 import PSMILESDebertaEncoder, build_psmiles_tokenizer
 
 # HF Trainer & Transformers
-from transformers import TrainingArguments, Trainer, DebertaV2ForMaskedLM, DebertaV2Tokenizer
+from transformers import TrainingArguments, Trainer
 from transformers import DataCollatorForLanguageModeling
 from transformers.trainer_callback import TrainerCallback
 
@@ -42,7 +37,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, f1_score, mean_squared_error, mean_absolute_error
 
 # ---------------------------
-# Config / Hyperparams (kept same as in your scripts)
+# Config / Hyperparams (paths are placeholders; update for your environment)
 # ---------------------------
 P_MASK = 0.15
 MAX_ATOMIC_Z = 85
@@ -53,19 +48,19 @@ NODE_EMB_DIM = 300
 EDGE_EMB_DIM = 300
 NUM_GNN_LAYERS = 5
 
-# SchNet params (from your file)
+# SchNet params 
 SCHNET_NUM_GAUSSIANS = 50
 SCHNET_NUM_INTERACTIONS = 6
 SCHNET_CUTOFF = 10.0
 SCHNET_MAX_NEIGHBORS = 64
 SCHNET_HIDDEN = 600
 
-# Fingerprint (MLM) params
+# Transformer params
 FP_LENGTH = 2048
-MASK_TOKEN_ID_FP = 2  # consistent with your fingerprint file
+MASK_TOKEN_ID_FP = 2  
 VOCAB_SIZE_FP = 3
 
-# PSMILES/Deberta params (from your file)
+# DeBERTav2 params 
 DEBERTA_HIDDEN = 600
 PSMILES_MAX_LEN = 128
 
@@ -73,15 +68,15 @@ PSMILES_MAX_LEN = 128
 TEMPERATURE = 0.07
 
 # Reconstruction loss weight (balance between contrastive and reconstruction objectives)
-REC_LOSS_WEIGHT = 1.0  # you can tune this (e.g., 0.5, 1.0)
+REC_LOSS_WEIGHT = 1.0  # could be tuned (e.g., 0.5, 1.0)
 
-# Training args (same across files)
-OUTPUT_DIR = "./multimodal_output"
+# Training args 
+OUTPUT_DIR = "/path/to/multimodal_output"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-BEST_GINE_DIR = "./gin_output/best"
-BEST_SCHNET_DIR = "./schnet_output/best"
-BEST_FP_DIR = "./fingerprint_mlm_output/best"
-BEST_PSMILES_DIR = "./polybert_output/best"
+BEST_GINE_DIR = "/path/to/gin_output/best"
+BEST_SCHNET_DIR = "/path/to/schnet_output/best"
+BEST_FP_DIR = "/path/to/fingerprint_mlm_output/best"
+BEST_PSMILES_DIR = "/path/to/polybert_output/best"
 
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
@@ -127,52 +122,7 @@ if USE_CUDA:
 #  Utility / small helpers
 # ---------------------------
 
-def safe_get(d: dict, key: str, default=None):
-    return d[key] if (isinstance(d, dict) and key in d) else default
-
-
-def match_edge_attr_to_index(edge_index: torch.Tensor, edge_attr: torch.Tensor, target_dim: int = 3):
-    # determine device to allocate zero tensors on
-    dev = None
-    if edge_attr is not None and hasattr(edge_attr, "device"):
-        dev = edge_attr.device
-    elif edge_index is not None and hasattr(edge_index, "device"):
-        dev = edge_index.device
-    else:
-        dev = torch.device("cpu")
-
-    if edge_index is None or edge_index.numel() == 0:
-        return torch.zeros((0, target_dim), dtype=torch.float, device=dev)
-    E_idx = edge_index.size(1)
-    if edge_attr is None or edge_attr.numel() == 0:
-        return torch.zeros((E_idx, target_dim), dtype=torch.float, device=dev)
-    E_attr = edge_attr.size(0)
-    if E_attr == E_idx:
-        if edge_attr.size(1) != target_dim:
-            D = edge_attr.size(1)
-            if D < target_dim:
-                pad = torch.zeros((E_attr, target_dim - D), dtype=torch.float, device=edge_attr.device)
-                return torch.cat([edge_attr, pad], dim=1)
-            else:
-                return edge_attr[:, :target_dim]
-        return edge_attr
-    if E_attr * 2 == E_idx:
-        try:
-            return torch.cat([edge_attr, edge_attr], dim=0)
-        except Exception:
-            pass
-    reps = (E_idx + E_attr - 1) // E_attr
-    edge_rep = edge_attr.repeat(reps, 1)[:E_idx]
-    if edge_rep.size(1) != target_dim:
-        D = edge_rep.size(1)
-        if D < target_dim:
-            pad = torch.zeros((E_idx, target_dim - D), dtype=torch.float, device=edge_rep.device)
-            edge_rep = torch.cat([edge_rep, pad], dim=1)
-        else:
-            edge_rep = edge_rep[:, :target_dim]
-    return edge_rep
-
-# Optimized BFS to compute distances to visible anchors (used if needed)
+# Optimized BFS to compute distances to visible anchors
 def bfs_distances_to_visible(edge_index: torch.Tensor, num_nodes: int, masked_idx: np.ndarray, visible_idx: np.ndarray, k_anchors: int):
     INF = num_nodes + 1
     selected_dists = np.zeros((num_nodes, k_anchors), dtype=np.float32)
@@ -213,13 +163,13 @@ def bfs_distances_to_visible(edge_index: torch.Tensor, num_nodes: int, masked_id
     return selected_dists, selected_mask
 
 # ---------------------------
-#  Data loading / preprocessing (streaming to disk to avoid memory spike)
+#  Data loading / preprocessing
 # ---------------------------
-CSV_PATH = "Polymer_Foundational_Model/polymer_structures_unified_processed.csv"
+CSV_PATH = "/path/to/polymer_structures_unified_processed.csv"
 TARGET_ROWS = 2000000
 CHUNKSIZE = 50000
 
-PREPROC_DIR = "preprocessed_samples"
+PREPROC_DIR = "/path/to/preprocessed_samples"
 os.makedirs(PREPROC_DIR, exist_ok=True)
 
 # The per-sample file format: torch.save(sample_dict, sample_path)
@@ -240,7 +190,6 @@ def prepare_or_load_data_streaming():
     rows_read = 0
     sample_idx = 0
 
-    # We'll parse CSV in chunks and for each row, if it contains all modalities, write sample to disk
     for chunk in pd.read_csv(CSV_PATH, engine="python", chunksize=CHUNKSIZE):
         # Pre-extract columns presence
         has_graph = "graph" in chunk.columns
@@ -446,48 +395,10 @@ def prepare_or_load_data_streaming():
 sample_files = prepare_or_load_data_streaming()
 
 # ---------------------------
-# Prepare tokenizer for psmiles (deferred, but we still attempt HF tokenizer; fallback created)
+# Prepare tokenizer for psmiles 
 # ---------------------------
-try:
-    SPM_MODEL = "spm.model"
-    if Path(SPM_MODEL).exists():
-        tokenizer = DebertaV2Tokenizer(vocab_file=SPM_MODEL, do_lower_case=False)
-        tokenizer.add_special_tokens({"pad_token": "<pad>", "mask_token": "<mask>"})
-        tokenizer.pad_token = "<pad>"
-        tokenizer.mask_token = "<mask>"
-    else:
-        tokenizer = DebertaV2Tokenizer.from_pretrained("microsoft/deberta-v2-xlarge", use_fast=False)
-        tokenizer.add_special_tokens({"pad_token": "<pad>", "mask_token": "<mask>"})
-        tokenizer.pad_token = "<pad>"
-        tokenizer.mask_token = "<mask>"
-except Exception as e:
-    print("Warning: Deberta tokenizer creation failed:", e)
-    # create a simple fallback tokenizer (char-level)
-    class SimplePSMILESTokenizer:
-        def __init__(self, max_len=PSMILES_MAX_LEN):
-            chars = list("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-=#()[]@+/\\.")
-            self.vocab = {c: i + 5 for i, c in enumerate(chars)}
-            self.vocab["<pad>"] = 0
-            self.vocab["<mask>"] = 1
-            self.vocab["<unk>"] = 2
-            self.vocab["<cls>"] = 3
-            self.vocab["<sep>"] = 4
-            self.mask_token = "<mask>"
-            self.mask_token_id = self.vocab[self.mask_token]
-            self.vocab_size = len(self.vocab)
-            self.max_len = max_len
-
-        def __call__(self, s, truncation=True, padding="max_length", max_length=None):
-            max_len = max_length or self.max_len
-            toks = [self.vocab.get(ch, self.vocab["<unk>"]) for ch in list(s)][:max_len]
-            attn = [1] * len(toks)
-            if len(toks) < max_len:
-                pad = [self.vocab["<pad>"]] * (max_len - len(toks))
-                toks = toks + pad
-                attn = attn + [0] * (max_len - len(attn))
-            return {"input_ids": toks, "attention_mask": attn}
-
-    tokenizer = SimplePSMILESTokenizer()
+SPM_MODEL = "/path/to/spm.model"
+tokenizer = build_psmiles_tokenizer(spm_path=SPM_MODEL, max_len=PSMILES_MAX_LEN)
 
 # ---------------------------
 # Lazy dataset: loads per-sample file on demand and tokenizes psmiles on-the-fly
@@ -672,313 +583,7 @@ train_loader = DataLoader(train_subset, batch_size=training_args.per_device_trai
 val_loader = DataLoader(val_subset, batch_size=training_args.per_device_eval_batch_size, shuffle=False, collate_fn=multimodal_collate, num_workers=0, drop_last=False)
 
 # ---------------------------
-# Encoder definitions (kept same as original with minimal device-safe guards)
-# ---------------------------
-
-class GineBlock(nn.Module):
-    def __init__(self, node_dim):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(node_dim, node_dim),
-            nn.ReLU(),
-            nn.Linear(node_dim, node_dim)
-        )
-        # If GINEConv is not available, we still construct placeholder to fail later with message
-        if GINEConv is None:
-            raise RuntimeError("GINEConv is not available. Install torch_geometric with compatible versions.")
-        self.conv = GINEConv(self.mlp)
-        self.bn = nn.BatchNorm1d(node_dim)
-        self.act = nn.ReLU()
-
-    def forward(self, x, edge_index, edge_attr):
-        x = self.conv(x, edge_index, edge_attr)
-        x = self.bn(x)
-        x = self.act(x)
-        return x
-
-class GineEncoder(nn.Module):
-    def __init__(self, node_emb_dim=NODE_EMB_DIM, edge_emb_dim=EDGE_EMB_DIM, num_layers=NUM_GNN_LAYERS, max_atomic_z=MAX_ATOMIC_Z):
-        super().__init__()
-        self.atom_emb = nn.Embedding(num_embeddings=MASK_ATOM_ID+1, embedding_dim=node_emb_dim, padding_idx=None)
-        self.node_attr_proj = nn.Sequential(
-            nn.Linear(2, node_emb_dim),
-            nn.ReLU(),
-            nn.Linear(node_emb_dim, node_emb_dim)
-        )
-        self.edge_encoder = nn.Sequential(
-            nn.Linear(3, edge_emb_dim),
-            nn.ReLU(),
-            nn.Linear(edge_emb_dim, edge_emb_dim)
-        )
-        if edge_emb_dim != node_emb_dim:
-            self._edge_to_node_proj = nn.Linear(edge_emb_dim, node_emb_dim)
-        else:
-            self._edge_to_node_proj = None
-        self.gnn_layers = nn.ModuleList([GineBlock(node_emb_dim) for _ in range(num_layers)])
-        # global pooling projection
-        self.pool_proj = nn.Linear(node_emb_dim, node_emb_dim)
-
-        # node-level classifier head for reconstructing atomic ids if needed
-        self.node_classifier = nn.Linear(node_emb_dim, MASK_ATOM_ID+1)
-
-    def _compute_node_reps(self, z, chirality, formal_charge, edge_index, edge_attr):
-        device = next(self.parameters()).device
-        atom_embedding = self.atom_emb(z.to(device))
-        if chirality is None or formal_charge is None:
-            node_attr = torch.zeros((z.size(0), 2), device=device)
-        else:
-            node_attr = torch.stack([chirality, formal_charge], dim=1).to(atom_embedding.device)
-        node_attr_emb = self.node_attr_proj(node_attr)
-        x = atom_embedding + node_attr_emb
-        if edge_attr is None or edge_attr.numel() == 0:
-            edge_emb = torch.zeros((0, EDGE_EMB_DIM), dtype=torch.float, device=x.device)
-        else:
-            edge_emb = self.edge_encoder(edge_attr.to(x.device))
-        if self._edge_to_node_proj is not None and edge_emb.numel() > 0:
-            edge_for_conv = self._edge_to_node_proj(edge_emb)
-        else:
-            edge_for_conv = edge_emb
-
-        h = x
-        for layer in self.gnn_layers:
-            h = layer(h, edge_index.to(h.device), edge_for_conv)
-        return h
-
-    def forward(self, z, chirality, formal_charge, edge_index, edge_attr, batch=None):
-        h = self._compute_node_reps(z, chirality, formal_charge, edge_index, edge_attr)
-        if batch is None:
-            pooled = torch.mean(h, dim=0, keepdim=True)
-        else:
-            bsize = int(batch.max().item() + 1) if batch.numel() > 0 else 1
-            pooled = torch.zeros((bsize, h.size(1)), device=h.device)
-            for i in range(bsize):
-                mask = batch == i
-                if mask.sum() == 0:
-                    continue
-                pooled[i] = h[mask].mean(dim=0)
-        return self.pool_proj(pooled)
-
-    def node_logits(self, z, chirality, formal_charge, edge_index, edge_attr):
-        h = self._compute_node_reps(z, chirality, formal_charge, edge_index, edge_attr)
-        logits = self.node_classifier(h)
-        return logits
-
-class NodeSchNetWrapper(nn.Module):
-    def __init__(self, hidden_channels=SCHNET_HIDDEN, num_interactions=SCHNET_NUM_INTERACTIONS, num_gaussians=SCHNET_NUM_GAUSSIANS, cutoff=SCHNET_CUTOFF, max_num_neighbors=SCHNET_MAX_NEIGHBORS):
-        super().__init__()
-        if PyGSchNet is None:
-            raise RuntimeError("PyG SchNet is not available. Install torch_geometric with compatible extras.")
-        self.schnet = PyGSchNet(hidden_channels=hidden_channels, num_filters=hidden_channels, num_interactions=num_interactions, num_gaussians=num_gaussians, cutoff=cutoff, max_num_neighbors=max_num_neighbors)
-        self.pool_proj = nn.Linear(hidden_channels, hidden_channels)
-        self.cutoff = cutoff
-        self.max_num_neighbors = max_num_neighbors
-        self.node_classifier = nn.Linear(hidden_channels, MASK_ATOM_ID+1)
-
-    def forward(self, z, pos, batch=None):
-        device = next(self.parameters()).device
-        z = z.to(device)
-        pos = pos.to(device)
-        if batch is None:
-            batch = torch.zeros(z.size(0), dtype=torch.long, device=z.device)
-        try:
-            edge_index = radius_graph(pos, r=self.cutoff, batch=batch, max_num_neighbors=self.max_num_neighbors)
-        except Exception:
-            edge_index = None
-
-        node_h = None
-        try:
-            if hasattr(self.schnet, "embedding"):
-                node_h = self.schnet.embedding(z)
-            else:
-                node_h = self.schnet.embedding(z)
-        except Exception:
-            node_h = None
-
-        if node_h is not None and edge_index is not None and edge_index.numel() > 0:
-            row, col = edge_index
-            edge_weight = (pos[row] - pos[col]).norm(dim=-1)
-            edge_attr = None
-            if hasattr(self.schnet, "distance_expansion"):
-                try:
-                    edge_attr = self.schnet.distance_expansion(edge_weight)
-                except Exception:
-                    edge_attr = None
-            if edge_attr is None and hasattr(self.schnet, "gaussian_smearing"):
-                try:
-                    edge_attr = self.schnet.gaussian_smearing(edge_weight)
-                except Exception:
-                    edge_attr = None
-            if hasattr(self.schnet, "interactions") and getattr(self.schnet, "interactions") is not None:
-                for interaction in self.schnet.interactions:
-                    try:
-                        node_h = node_h + interaction(node_h, edge_index, edge_weight, edge_attr)
-                    except TypeError:
-                        node_h = node_h + interaction(node_h, edge_index, edge_weight)
-        if node_h is None:
-            try:
-                out = self.schnet(z=z, pos=pos, batch=batch)
-                if isinstance(out, torch.Tensor) and out.dim() == 2 and out.size(0) == z.size(0):
-                    node_h = out
-                elif hasattr(out, "last_hidden_state"):
-                    node_h = out.last_hidden_state
-                elif isinstance(out, (tuple, list)) and len(out) > 0 and isinstance(out[0], torch.Tensor):
-                    cand = out[0]
-                    if cand.dim() == 2 and cand.size(0) == z.size(0):
-                        node_h = cand
-            except Exception as e:
-                raise RuntimeError("Failed to obtain node-level embeddings from PyG SchNet.") from e
-
-        bsize = int(batch.max().item()) + 1 if z.numel() > 0 else 1
-        pooled = torch.zeros((bsize, node_h.size(1)), device=node_h.device)
-        for i in range(bsize):
-            mask = batch == i
-            if mask.sum() == 0:
-                continue
-            pooled[i] = node_h[mask].mean(dim=0)
-        return self.pool_proj(pooled)
-
-    def node_logits(self, z, pos, batch=None):
-        device = next(self.parameters()).device
-        z = z.to(device)
-        pos = pos.to(device)
-        if batch is None:
-            batch = torch.zeros(z.size(0), dtype=torch.long, device=z.device)
-        try:
-            edge_index = radius_graph(pos, r=self.cutoff, batch=batch, max_num_neighbors=self.max_num_neighbors)
-        except Exception:
-            edge_index = None
-
-        node_h = None
-        try:
-            if hasattr(self.schnet, "embedding"):
-                node_h = self.schnet.embedding(z)
-        except Exception:
-            node_h = None
-
-        if node_h is not None and edge_index is not None and edge_index.numel() > 0:
-            row, col = edge_index
-            edge_weight = (pos[row] - pos[col]).norm(dim=-1)
-            edge_attr = None
-            if hasattr(self.schnet, "distance_expansion"):
-                try:
-                    edge_attr = self.schnet.distance_expansion(edge_weight)
-                except Exception:
-                    edge_attr = None
-            if edge_attr is None and hasattr(self.schnet, "gaussian_smearing"):
-                try:
-                    edge_attr = self.schnet.gaussian_smearing(edge_weight)
-                except Exception:
-                    edge_attr = None
-            if hasattr(self.schnet, "interactions") and getattr(self.schnet, "interactions") is not None:
-                for interaction in self.schnet.interactions:
-                    try:
-                        node_h = node_h + interaction(node_h, edge_index, edge_weight, edge_attr)
-                    except TypeError:
-                        node_h = node_h + interaction(node_h, edge_index, edge_weight)
-
-        if node_h is None:
-            out = self.schnet(z=z, pos=pos, batch=batch)
-            if isinstance(out, torch.Tensor):
-                node_h = out
-            elif hasattr(out, "last_hidden_state"):
-                node_h = out.last_hidden_state
-            elif isinstance(out, (tuple, list)) and len(out) > 0 and isinstance(out[0], torch.Tensor):
-                node_h = out[0]
-            else:
-                raise RuntimeError("Unable to obtain node embeddings for SchNet node_logits")
-
-        logits = self.node_classifier(node_h)
-        return logits
-
-class FingerprintEncoder(nn.Module):
-    def __init__(self, vocab_size=VOCAB_SIZE_FP, hidden_dim=256, seq_len=FP_LENGTH, num_layers=4, nhead=8, dim_feedforward=1024, dropout=0.1):
-        super().__init__()
-        self.token_emb = nn.Embedding(vocab_size, hidden_dim)
-        self.pos_emb = nn.Embedding(seq_len, hidden_dim)
-        encoder_layer = nn.TransformerEncoderLayer(d_model=hidden_dim, nhead=nhead, dim_feedforward=dim_feedforward, dropout=dropout, batch_first=True)
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-        self.pool_proj = nn.Linear(hidden_dim, hidden_dim)
-        self.seq_len = seq_len
-        self.token_proj = nn.Linear(hidden_dim, vocab_size)
-
-    def forward(self, input_ids, attention_mask=None):
-        device = next(self.parameters()).device
-        input_ids = input_ids.to(device)
-        B, L = input_ids.shape
-        x = self.token_emb(input_ids)
-        pos_ids = torch.arange(L, device=input_ids.device).unsqueeze(0).expand(B, -1)
-        x = x + self.pos_emb(pos_ids)
-        if attention_mask is not None:
-            key_padding_mask = ~attention_mask.to(input_ids.device)
-        else:
-            key_padding_mask = None
-        out = self.transformer(x, src_key_padding_mask=key_padding_mask)
-        if attention_mask is None:
-            pooled = out.mean(dim=1)
-        else:
-            am = attention_mask.to(out.device).float().unsqueeze(-1)
-            pooled = (out * am).sum(dim=1) / (am.sum(dim=1).clamp(min=1.0))
-        return self.pool_proj(pooled)
-
-    def token_logits(self, input_ids, attention_mask=None):
-        device = next(self.parameters()).device
-        input_ids = input_ids.to(device)
-        B, L = input_ids.shape
-        x = self.token_emb(input_ids)
-        pos_ids = torch.arange(L, device=input_ids.device).unsqueeze(0).expand(B, -1)
-        x = x + self.pos_emb(pos_ids)
-        if attention_mask is not None:
-            key_padding_mask = ~attention_mask.to(input_ids.device)
-        else:
-            key_padding_mask = None
-        out = self.transformer(x, src_key_padding_mask=key_padding_mask)
-        logits = self.token_proj(out)
-        return logits
-
-class PSMILESDebertaEncoder(nn.Module):
-    def __init__(self, model_dir_or_name: Optional[str] = None):
-        super().__init__()
-        try:
-            if model_dir_or_name is not None and os.path.isdir(model_dir_or_name):
-                self.model = DebertaV2ForMaskedLM.from_pretrained(model_dir_or_name)
-            else:
-                self.model = DebertaV2ForMaskedLM.from_pretrained("microsoft/deberta-v2-xlarge")
-        except Exception as e:
-            print("Warning: couldn't load DebertaV2 pretrained weights; initializing randomly.", e)
-            from transformers import DebertaV2Config
-            cfg = DebertaV2Config(vocab_size=getattr(tokenizer, "vocab_size", 300), hidden_size=DEBERTA_HIDDEN, num_attention_heads=12, num_hidden_layers=12, intermediate_size=512)
-            self.model = DebertaV2ForMaskedLM(cfg)
-        self.pool_proj = nn.Linear(self.model.config.hidden_size, self.model.config.hidden_size)
-
-    def forward(self, input_ids, attention_mask=None):
-        device = next(self.parameters()).device
-        input_ids = input_ids.to(device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-        outputs = self.model.base_model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-        last_hidden = outputs.last_hidden_state
-        if attention_mask is None:
-            pooled = last_hidden.mean(dim=1)
-        else:
-            am = attention_mask.unsqueeze(-1).to(last_hidden.device).float()
-            pooled = (last_hidden * am).sum(dim=1) / (am.sum(dim=1).clamp(min=1.0))
-        return self.pool_proj(pooled)
-
-    def token_logits(self, input_ids, attention_mask=None, labels=None):
-        device = next(self.parameters()).device
-        input_ids = input_ids.to(device)
-        if attention_mask is not None:
-            attention_mask = attention_mask.to(device)
-        if labels is not None:
-            labels = labels.to(device)
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels, return_dict=True)
-            return outputs.loss
-        else:
-            outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
-            return outputs.logits
-
-# ---------------------------
-# Multimodal wrapper & loss (kept same)
+# Multimodal wrapper & loss 
 # ---------------------------
 class MultimodalContrastiveModel(nn.Module):
     def __init__(self,
