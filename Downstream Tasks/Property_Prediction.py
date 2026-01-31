@@ -1,4 +1,3 @@
-
 import os
 import random
 import time
@@ -20,66 +19,77 @@ import csv
 import copy
 from typing import List, Dict, Optional, Tuple, Any
 
+# Increase CSV field size limit (PolyInfo modality JSON fields can be large).
 csv.field_size_limit(sys.maxsize)
 
-# Shared encoders/helpers from PolyFusion
+# =============================================================================
+# Imports: Shared encoders/helpers from PolyFusion
+# =============================================================================
 from PolyFusion.GINE import GineEncoder, match_edge_attr_to_index, safe_get
 from PolyFusion.SchNet import NodeSchNetWrapper
 from PolyFusion.Transformer import PooledFingerprintEncoder as FingerprintEncoder
 from PolyFusion.DeBERTav2 import PSMILESDebertaEncoder, build_psmiles_tokenizer
 
-# -----------------------------
+# =============================================================================
 # Configuration
-# -----------------------------
+# =============================================================================
 BASE_DIR = "/path/to/Polymer_Foundational_Model"
 POLYINFO_PATH = "/path/to/polyinfo_with_modalities.csv"
 
-# Pretrained model directories 
+# Pretrained encoder directories (update these placeholders)
 PRETRAINED_MULTIMODAL_DIR = "/path/to/multimodal_output/best"
 BEST_GINE_DIR = "/path/to/gin_output/best"
 BEST_SCHNET_DIR = "/path/to/schnet_output/best"
 BEST_FP_DIR = "/path/to/fingerprint_mlm_output/best"
 BEST_PSMILES_DIR = "/path/to/polybert_output/best"
 
+# Output log file (per-run json lines + per-property aggregated summary)
 OUTPUT_RESULTS = "/path/to/multimodal_downstream_results.txt"
 
-# NEW: directory to save best-performing weights per property (best run/"fold")
+# Directory to save best-performing checkpoint bundle per property (best CV run)
 BEST_WEIGHTS_DIR = "/path/to/multimodal_downstream_bestweights"
 
-# Model hyperparameters (matching multimodal training)
+# -----------------------------------------------------------------------------
+# Model sizes / dims (must match your pretrained multimodal encoder settings)
+# -----------------------------------------------------------------------------
 MAX_ATOMIC_Z = 85
 MASK_ATOM_ID = MAX_ATOMIC_Z + 1
 
-# GINE params
+# GINE
 NODE_EMB_DIM = 300
 EDGE_EMB_DIM = 300
 NUM_GNN_LAYERS = 5
 
-# SchNet params
+# SchNet
 SCHNET_NUM_GAUSSIANS = 50
 SCHNET_NUM_INTERACTIONS = 6
 SCHNET_CUTOFF = 10.0
 SCHNET_MAX_NEIGHBORS = 64
 SCHNET_HIDDEN = 600
 
-# Fingerprint params
+# Fingerprints
 FP_LENGTH = 2048
 MASK_TOKEN_ID_FP = 2
 VOCAB_SIZE_FP = 3
 
+# Contrastive embedding dim
 CL_EMB_DIM = 600
 
-# PSMILES/Deberta params
+# PSMILES/DeBERTa
 DEBERTA_HIDDEN = 600
 PSMILES_MAX_LEN = 128
 
-# Uni-Poly fusion params
-UNIPOLY_EMB_DIM = 600
-UNIPOLY_ATTN_HEADS = 8
-UNIPOLY_DROPOUT = 0.1
-UNIPOLY_FF_MULT = 4  # FFN hidden = 4*d (common transformer practice)
+# -----------------------------------------------------------------------------
+# Uni-Poly style fusion + regression head hyperparameters
+# -----------------------------------------------------------------------------
+POLYF_EMB_DIM = 600
+POLYF_ATTN_HEADS = 8
+POLYF_DROPOUT = 0.1
+POLYF_FF_MULT = 4  # FFN hidden = 4*d (common transformer practice)
 
-# Training parameters (Uni-Poly fine-tuning)
+# -----------------------------------------------------------------------------
+# Fine-tuning parameters (single-task per property)
+# -----------------------------------------------------------------------------
 MAX_LEN = 128
 BATCH_SIZE = 32
 NUM_EPOCHS = 100
@@ -89,6 +99,7 @@ WEIGHT_DECAY = 0.0
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# Properties to evaluate (order preserved)
 REQUESTED_PROPERTIES = [
     "density",
     "glass transition",
@@ -97,28 +108,31 @@ REQUESTED_PROPERTIES = [
     "thermal decomposition"
 ]
 
-# Uni-Poly reports stats over fivefold CV; we implement true 5-fold CV here
+# True K-fold evaluation to match "fivefold per property"
 NUM_RUNS = 5
 TEST_SIZE = 0.10
-VAL_SIZE_WITHIN_TRAINVAL = 0.10  # of trainval (i.e., 9% overall when TEST_SIZE=0.10)
+VAL_SIZE_WITHIN_TRAINVAL = 0.10  # fraction of trainval reserved for val split
 
-# Optional: PolyInfo duplicate aggregation key preference order
+# Duplicate aggregation (noise reduction) key preference order
 AGG_KEYS_PREFERENCE = ["polymer_id", "PolymerID", "poly_id", "psmiles", "smiles", "canonical_smiles"]
 
-# -----------------------------
+# =============================================================================
 # Utilities
-# -----------------------------
+# =============================================================================
 def set_seed(seed: int):
+    """Set all relevant RNG seeds for reproducible folds."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    # Deterministic settings: reproducible but may reduce throughput.
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
 def make_json_serializable(obj):
+    """Convert common numpy/torch/pandas objects into JSON-safe Python types."""
     if isinstance(obj, dict):
         return {make_json_serializable(k): make_json_serializable(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set)):
@@ -144,7 +158,15 @@ def make_json_serializable(obj):
         pass
     return obj
 
+
 def summarize_state_dict_load(full_state: dict, model_state: dict, filtered_state: dict):
+    """
+    Print a concise load report:
+      - how many checkpoint keys exist
+      - how many model keys exist
+      - how many keys will be loaded (intersection with matching shapes)
+      - common reasons for skipped keys
+    """
     n_ckpt = len(full_state)
     n_model = len(model_state)
     n_loaded = len(filtered_state)
@@ -160,13 +182,13 @@ def summarize_state_dict_load(full_state: dict, model_state: dict, filtered_stat
     print(f"  ckpt keys:   {n_ckpt}")
     print(f"  model keys:  {n_model}")
     print(f"  loaded keys: {n_loaded}")
-    print(f"  skipped (not in model): {len(missing_in_model)}")
-    print(f"  skipped (shape mismatch): {len(shape_mismatch)}")
+    print(f"  skipped (not in model):     {len(missing_in_model)}")
+    print(f"  skipped (shape mismatch):   {len(shape_mismatch)}")
 
     if missing_in_model:
-        print("  examples missing_in_model:", missing_in_model[:10])
+        print("  examples skipped (not in model):", missing_in_model[:10])
     if shape_mismatch:
-        print("  examples shape_mismatch:")
+        print("  examples skipped (shape mismatch):")
         for k in shape_mismatch[:10]:
             print(f"    {k}: ckpt={tuple(full_state[k].shape)} model={tuple(model_state[k].shape)}")
     print("")
@@ -174,10 +196,10 @@ def summarize_state_dict_load(full_state: dict, model_state: dict, filtered_stat
 
 def find_property_columns(columns):
     """
-    Safer property column matching:
-    - Prefer exact token matches (word-level).
-    - For 'density' explicitly avoid matching columns that contain 'cohesive' (e.g., 'Cohesive energy density').
-    - Log candidates when ambiguity exists.
+    Robust property column matching with guardrails:
+      - Prefer word-level (token) matches over substring matches.
+      - For 'density', avoid confusing with 'cohesive energy density' columns.
+      - Log chosen column and competing candidates when ambiguous.
     """
     lowered = {c.lower(): c for c in columns}
     found = {}
@@ -186,6 +208,7 @@ def find_property_columns(columns):
         req_low = req.lower().strip()
         exact = None
 
+        # Pass 1: token-level exactness (safer than substring match)
         for c_low, c_orig in lowered.items():
             tokens = set(c_low.replace('_', ' ').split())
             if req_low in tokens or c_low == req_low:
@@ -198,6 +221,7 @@ def find_property_columns(columns):
             found[req] = exact
             continue
 
+        # Pass 2: substring match as fallback
         candidates = [c_orig for c_low, c_orig in lowered.items() if req_low in c_low]
         if req_low == "density":
             candidates = [c for c in candidates if "cohesive" not in c.lower() and "cohesive energy" not in c.lower()]
@@ -207,14 +231,16 @@ def find_property_columns(columns):
         else:
             chosen = candidates[0] if candidates else None
             found[req] = chosen
-            print(f"[INFO] Requested property '{req}' -> chosen column: {chosen}")
+            print(f"[COLMAP] Requested '{req}' -> chosen column: {chosen}")
             if candidates:
-                print(f"[INFO] Candidates for '{req}': {candidates}")
+                print(f"[COLMAP] Candidates for '{req}': {candidates}")
             else:
-                print(f"[WARN] No candidates found for '{req}' using substring search.")
+                print(f"[COLMAP][WARN] No candidates found for '{req}' using substring search.")
     return found
 
+
 def choose_aggregation_key(df: pd.DataFrame) -> Optional[str]:
+    """Pick the most stable identifier available for duplicate aggregation."""
     for k in AGG_KEYS_PREFERENCE:
         if k in df.columns:
             return k
@@ -223,38 +249,38 @@ def choose_aggregation_key(df: pd.DataFrame) -> Optional[str]:
 
 def aggregate_polyinfo_duplicates(df: pd.DataFrame, modality_cols: List[str], property_cols: List[str]) -> pd.DataFrame:
     """
-    Uni-Poly describes grouping samples for the same monomer and averaging properties to reduce noise.
-    We apply that here if we can identify a stable key (polymer_id / psmiles / smiles).
+    Optional noise reduction: group duplicate polymer entries and average properties.
+
+    - Modalities are taken as "first" (they should be consistent per polymer key).
+    - Properties are averaged (mean).
     """
     key = choose_aggregation_key(df)
     if key is None:
-        print("[INFO] No aggregation key found; skipping duplicate aggregation.")
+        print("[AGG] No aggregation key found; skipping duplicate aggregation.")
         return df
 
-    # Keep only rows with a non-empty key
     df2 = df.copy()
     df2[key] = df2[key].astype(str)
     df2 = df2[df2[key].str.strip() != ""].copy()
     if len(df2) == 0:
-        print("[INFO] Aggregation key exists but is empty; skipping duplicate aggregation.")
+        print("[AGG] Aggregation key exists but is empty; skipping duplicate aggregation.")
         return df
 
     agg_dict = {}
-    # modalities: take first non-null string (they should be identical per polymer id in your dataset)
     for mc in modality_cols:
         if mc in df2.columns:
             agg_dict[mc] = "first"
-    # properties: mean
     for pc in property_cols:
         if pc in df2.columns:
             agg_dict[pc] = "mean"
 
     grouped = df2.groupby(key, as_index=False).agg(agg_dict)
-    print(f"[INFO] Aggregated duplicates by '{key}': {len(df)} rows -> {len(grouped)} unique keys")
+    print(f"[AGG] Grouped by '{key}': {len(df)} rows -> {len(grouped)} unique keys")
     return grouped
 
 
 def _sanitize_name(s: str) -> str:
+    """Create a filesystem-safe name for property directories."""
     s2 = str(s).strip().lower()
     keep = []
     for ch in s2:
@@ -270,20 +296,29 @@ def _sanitize_name(s: str) -> str:
     out = out.strip("_")
     return out or "property"
 
+
+# =============================================================================
+# Multimodal backbone: encode + project + modality-aware fusion
+# =============================================================================
 class MultimodalContrastiveModel(nn.Module):
     """
-    Multimodal encoder wrapper that:
-      - Takes pretrained modality encoders (GINE / SchNet / FP / PSMILES)
-      - Projects each modality to emb_dim
-      - L2-normalizes per modality embedding, then masked-mean combines across available modalities
-      - L2-normalizes final combined embedding
+    Multimodal encoder wrapper:
 
-    This version matches your downstream instantiation:
-        MultimodalContrastiveModel(gine_encoder, schnet_encoder, fp_encoder, psmiles_encoder,
-                                  emb_dim=..., modalities=[...])
+      1) Runs each available modality encoder:
+           - GINE (graph)
+           - SchNet (3D geometry)
+           - Transformer FP encoder (Morgan bit sequence)
+           - DeBERTa-based PSMILES encoder (sequence)
 
-    And your downstream forward usage:
-        z = model(batch_mods, modality_mask=modality_mask)
+      2) Projects each modality embedding to a shared dim (emb_dim).
+
+      3) Normalizes each modality embedding (L2), drops out, then fuses via
+         a masked mean across modalities that are present for each sample.
+
+      4) Normalizes the final fused embedding (L2).
+
+    Expected downstream usage:
+        z = model(batch_mods, modality_mask=modality_mask)  # (B, emb_dim)
     """
 
     def __init__(
@@ -310,7 +345,7 @@ class MultimodalContrastiveModel(nn.Module):
         self.out_dim = self.emb_dim
         self.dropout = nn.Dropout(float(dropout))
 
-        # Decide which modalities are enabled
+        # Determine which modalities are enabled
         if modalities is None:
             mods = []
             if self.gine is not None:
@@ -325,12 +360,12 @@ class MultimodalContrastiveModel(nn.Module):
         else:
             self.modalities = [m for m in modalities if m in ("gine", "schnet", "fp", "psmiles")]
 
-        # Projection heads (match dims used elsewhere in your script)
+        # Projection heads into shared embedding space
         self.proj_gine = nn.Linear(NODE_EMB_DIM, self.emb_dim) if self.gine is not None else None
         self.proj_schnet = nn.Linear(SCHNET_HIDDEN, self.emb_dim) if self.schnet is not None else None
         self.proj_fp = nn.Linear(256, self.emb_dim) if self.fp is not None else None
 
-        # PSMILES encoder may not always be exactly DEBERTA_HIDDEN; try to infer
+        # Infer PSMILES hidden size if possible; fallback to DEBERTA_HIDDEN
         psm_in = None
         if self.psmiles is not None:
             if hasattr(self.psmiles, "out_dim"):
@@ -349,7 +384,7 @@ class MultimodalContrastiveModel(nn.Module):
         self.proj_psmiles = nn.Linear(psm_in, self.emb_dim) if (self.psmiles is not None) else None
 
     def freeze_cl_encoders(self):
-        """Optional helper to freeze modality encoders."""
+        """Freeze all modality encoders (optional for evaluation-only usage)."""
         for enc in (self.gine, self.schnet, self.fp, self.psmiles):
             if enc is None:
                 continue
@@ -359,9 +394,11 @@ class MultimodalContrastiveModel(nn.Module):
 
     def _masked_mean_combine(self, zs: List[torch.Tensor], masks: List[torch.Tensor]) -> torch.Tensor:
         """
-        zs:   list of (B,D)
-        masks:list of (B,) boolean, True where modality is present
-        returns: (B,D) masked mean
+        Compute sample-wise mean over available modalities.
+
+        zs:    list of modality embeddings, each (B,D)
+        masks: list of modality presence masks, each (B,) bool
+        returns: (B,D)
         """
         if not zs:
             device = next(self.parameters()).device
@@ -384,22 +421,21 @@ class MultimodalContrastiveModel(nn.Module):
     def forward(self, batch_mods: dict, modality_mask: Optional[dict] = None) -> torch.Tensor:
         """
         batch_mods keys: 'gine', 'schnet', 'fp', 'psmiles'
-        modality_mask: dict with boolean tensors of shape (B,) for each modality
+        modality_mask: dict {modality_name: (B,) bool} describing presence.
         """
         device = next(self.parameters()).device
 
         zs = []
         ms = []
 
-        # Determine batch size B from any available modality tensor
+        # Infer batch size B
         B = None
         if modality_mask is not None:
-            for k, v in modality_mask.items():
+            for _, v in modality_mask.items():
                 if isinstance(v, torch.Tensor) and v.numel() > 0:
                     B = int(v.size(0))
                     break
 
-        # Fallback: infer B from fp/psmiles tensors
         if B is None:
             if "fp" in batch_mods and batch_mods["fp"] is not None and isinstance(batch_mods["fp"].get("input_ids", None), torch.Tensor):
                 B = int(batch_mods["fp"]["input_ids"].size(0))
@@ -409,13 +445,14 @@ class MultimodalContrastiveModel(nn.Module):
         if B is None:
             return torch.zeros((1, self.emb_dim), device=device)
 
-        # Helper to get modality present mask
         def _get_mask(name: str) -> torch.Tensor:
             if modality_mask is not None and name in modality_mask and isinstance(modality_mask[name], torch.Tensor):
                 return modality_mask[name].to(device).bool()
             return torch.ones((B,), device=device, dtype=torch.bool)
 
-        # GINE
+        # -------------------------
+        # GINE (graph modality)
+        # -------------------------
         if "gine" in self.modalities and self.gine is not None and batch_mods.get("gine", None) is not None:
             g = batch_mods["gine"]
             if isinstance(g.get("z", None), torch.Tensor) and g["z"].numel() > 0:
@@ -433,7 +470,9 @@ class MultimodalContrastiveModel(nn.Module):
                 zs.append(z)
                 ms.append(_get_mask("gine"))
 
-        # SchNet
+        # -------------------------
+        # SchNet (3D geometry)
+        # -------------------------
         if "schnet" in self.modalities and self.schnet is not None and batch_mods.get("schnet", None) is not None:
             s = batch_mods["schnet"]
             if isinstance(s.get("z", None), torch.Tensor) and s["z"].numel() > 0:
@@ -448,7 +487,9 @@ class MultimodalContrastiveModel(nn.Module):
                 zs.append(z)
                 ms.append(_get_mask("schnet"))
 
-        # FP
+        # -------------------------
+        # Fingerprint modality
+        # -------------------------
         if "fp" in self.modalities and self.fp is not None and batch_mods.get("fp", None) is not None:
             f = batch_mods["fp"]
             if isinstance(f.get("input_ids", None), torch.Tensor) and f["input_ids"].numel() > 0:
@@ -462,7 +503,9 @@ class MultimodalContrastiveModel(nn.Module):
                 zs.append(z)
                 ms.append(_get_mask("fp"))
 
-        # PSMILES
+        # -------------------------
+        # PSMILES text modality
+        # -------------------------
         if "psmiles" in self.modalities and self.psmiles is not None and batch_mods.get("psmiles", None) is not None:
             p = batch_mods["psmiles"]
             if isinstance(p.get("input_ids", None), torch.Tensor) and p["input_ids"].numel() > 0:
@@ -476,14 +519,13 @@ class MultimodalContrastiveModel(nn.Module):
                 zs.append(z)
                 ms.append(_get_mask("psmiles"))
 
-        # Combine (masked mean), then normalize
+        # Fuse and normalize
         if not zs:
             return torch.zeros((B, self.emb_dim), device=device)
 
         z = self._masked_mean_combine(zs, ms)
         z = F.normalize(z, dim=-1)
         return z
-
 
     @torch.no_grad()
     def encode_psmiles(
@@ -494,7 +536,7 @@ class MultimodalContrastiveModel(nn.Module):
         device: str = DEVICE
     ) -> np.ndarray:
         """
-        PSMILES-only embeddings (used for generated candidates + oracle).
+        Convenience: PSMILES-only embeddings (used for fast bulk encoding tasks).
         """
         self.eval()
         if self.psm_tok is None or self.psmiles is None or self.proj_psmiles is None:
@@ -519,9 +561,9 @@ class MultimodalContrastiveModel(nn.Module):
         device: str = DEVICE
     ) -> np.ndarray:
         """
-        Full multimodal embeddings for records that carry:
-          graph, geometry, fingerprints, psmiles
-        Missing modalities are skipped per-sample (combine is mean over available).
+        Convenience: multimodal embedding for records carrying:
+          - graph, geometry, fingerprints, psmiles
+        Missing modalities are handled sample-wise via modality masking.
         """
         self.eval()
         dev = torch.device(device)
@@ -531,14 +573,13 @@ class MultimodalContrastiveModel(nn.Module):
         for i in range(0, len(records), batch_size):
             chunk = records[i:i + batch_size]
 
-            # Build per-sample modality tensors; do minimal batching (stack where possible)
             # PSMILES batch
             psmiles_texts = [str(r.get("psmiles", "")) for r in chunk]
             p_enc = None
             if self.psm_tok is not None:
                 p_enc = self.psm_tok(psmiles_texts, truncation=True, padding="max_length", max_length=PSMILES_MAX_LEN, return_tensors="pt")
 
-            # FP batch
+            # FP batch (always stack; missing handled by attention_mask downstream)
             fp_ids, fp_attn = [], []
             for r in chunk:
                 f = _parse_fingerprints(r.get("fingerprints", None), fp_len=FP_LENGTH)
@@ -547,8 +588,7 @@ class MultimodalContrastiveModel(nn.Module):
             fp_ids = torch.stack(fp_ids, dim=0)
             fp_attn = torch.stack(fp_attn, dim=0)
 
-            # GINE and SchNet: variable-size; we keep as “packed” with simple batch vectors
-            # (mean pooling per sample already handled in encoder via batch vectors)
+            # GINE + SchNet packed batching
             gine_all = {"z": [], "chirality": [], "formal_charge": [], "edge_index": [], "edge_attr": [], "batch": []}
             node_offset = 0
             for bi, r in enumerate(chunk):
@@ -606,21 +646,32 @@ class MultimodalContrastiveModel(nn.Module):
                 "psmiles": {"input_ids": p_enc["input_ids"], "attention_mask": p_enc["attention_mask"]} if p_enc is not None else None
             }
 
-            z = self.forward_multimodal(batch_mods)
+            # NOTE: This script uses forward() as the encoder entry point.
+            z = self.forward(batch_mods, modality_mask=None)
             outs.append(z.detach().cpu().numpy())
 
         return np.concatenate(outs, axis=0) if outs else np.zeros((0, self.emb_dim), dtype=np.float32)
 
-# -----------------------------
+
+# =============================================================================
 # Tokenizer setup
-# -----------------------------
+# =============================================================================
 SPM_MODEL = "/path/to/spm.model"
 tokenizer = build_psmiles_tokenizer(spm_path=SPM_MODEL, max_len=PSMILES_MAX_LEN)
 
-# -----------------------------
-# Dataset (single-task, Uni-Poly fine-tuning style)
-# -----------------------------
+# =============================================================================
+# Dataset: single-task property prediction (with modality parsing)
+# =============================================================================
 class PolymerPropertyDataset(Dataset):
+    """
+    Dataset that prepares one sample with up to four modalities:
+      - graph (for GINE)
+      - geometry (for SchNet)
+      - fingerprints (for FP transformer)
+      - psmiles text (for DeBERTa encoder)
+
+    Target is a single scalar per sample (already scaled externally).
+    """
     def __init__(self, data_list, tokenizer, max_length=128):
         self.data_list = data_list
         self.tokenizer = tokenizer
@@ -632,7 +683,9 @@ class PolymerPropertyDataset(Dataset):
     def __getitem__(self, idx):
         data = self.data_list[idx]
 
-        # Parse graph data for GINE
+        # ---------------------------------------------------------------------
+        # Graph -> GINE tensors (robust parsing of stored JSON fields)
+        # ---------------------------------------------------------------------
         gine_data = None
         if 'graph' in data and data['graph']:
             try:
@@ -661,6 +714,7 @@ class PolymerPropertyDataset(Dataset):
                     edge_index = None
                     edge_attr = None
 
+                    # Fallback: adjacency matrix if edge_indices missing
                     if edge_indices_raw is None:
                         adj_mat = safe_get(graph_field, "adjacency_matrix", None)
                         if adj_mat:
@@ -676,6 +730,7 @@ class PolymerPropertyDataset(Dataset):
                                 E = len(srcs)
                                 edge_attr = [[0.0, 0.0, 0.0] for _ in range(E)]
                     else:
+                        # edge_indices can be [[srcs],[dsts]] or list of pairs
                         srcs, dsts = [], []
                         if isinstance(edge_indices_raw, list) and len(edge_indices_raw) > 0:
                             if isinstance(edge_indices_raw[0], list):
@@ -702,6 +757,7 @@ class PolymerPropertyDataset(Dataset):
                         if len(srcs) > 0:
                             edge_index = [srcs, dsts]
 
+                        # edge_features: attempt to map known fields; otherwise zeros
                         if edge_features_raw and isinstance(edge_features_raw, list):
                             bond_types = []
                             stereos = []
@@ -729,7 +785,9 @@ class PolymerPropertyDataset(Dataset):
             except Exception:
                 gine_data = None
 
-        # Parse geometry data for SchNet
+        # ---------------------------------------------------------------------
+        # Geometry -> SchNet tensors (best conformer)
+        # ---------------------------------------------------------------------
         schnet_data = None
         if 'geometry' in data and data['geometry']:
             try:
@@ -746,7 +804,9 @@ class PolymerPropertyDataset(Dataset):
             except Exception:
                 schnet_data = None
 
-        # Parse fingerprints
+        # ---------------------------------------------------------------------
+        # Fingerprints -> FP transformer inputs (bit sequence)
+        # ---------------------------------------------------------------------
         fp_data = None
         if 'fingerprints' in data and data['fingerprints']:
             try:
@@ -797,7 +857,9 @@ class PolymerPropertyDataset(Dataset):
             except Exception:
                 fp_data = None
 
-        # Parse PSMILES
+        # ---------------------------------------------------------------------
+        # PSMILES -> DeBERTa tokenizer inputs
+        # ---------------------------------------------------------------------
         psmiles_data = None
         if 'psmiles' in data and data['psmiles'] and self.tokenizer is not None:
             try:
@@ -815,7 +877,9 @@ class PolymerPropertyDataset(Dataset):
             except Exception:
                 psmiles_data = None
 
-        # Defaults for missing modalities
+        # ---------------------------------------------------------------------
+        # Fill defaults for missing modalities (keeps collate simpler)
+        # ---------------------------------------------------------------------
         if gine_data is None:
             gine_data = {
                 'z': torch.tensor([], dtype=torch.long),
@@ -843,7 +907,7 @@ class PolymerPropertyDataset(Dataset):
                 'attention_mask': torch.zeros(PSMILES_MAX_LEN, dtype=torch.bool)
             }
 
-        # Single-task target (scaled)
+        # Single-task regression target (already scaled)
         target_scaled = float(data.get("target_scaled", 0.0))
 
         return {
@@ -855,10 +919,23 @@ class PolymerPropertyDataset(Dataset):
         }
 
 
+# =============================================================================
+# Collate: pack variable-sized graph/3D into batch tensors + modality masks
+# =============================================================================
 def multimodal_collate_fn(batch):
+    """
+    Collate samples into a single minibatch.
+
+    - GINE: concatenate nodes across samples and build a `batch` vector.
+    - SchNet: concatenate atoms/coords across samples and build a `batch` vector.
+    - FP/PSMILES: stack to (B, L).
+    - modality_mask: per-sample boolean flags indicating availability.
+    """
     B = len(batch)
 
-    # GINE batching
+    # -------------------------
+    # GINE packing
+    # -------------------------
     all_z = []
     all_ch = []
     all_fc = []
@@ -905,7 +982,9 @@ def multimodal_collate_fn(batch):
             edge_index_batched = torch.empty((2, 0), dtype=torch.long)
             edge_attr_batched = torch.zeros((0, 3), dtype=torch.float)
 
-    # SchNet batching
+    # -------------------------
+    # SchNet packing
+    # -------------------------
     all_sz = []
     all_pos = []
     schnet_batch = []
@@ -930,12 +1009,16 @@ def multimodal_collate_fn(batch):
         s_pos_batch = torch.cat(all_pos, dim=0)
         s_batch_batch = torch.cat(schnet_batch, dim=0)
 
-    # FP batching
+    # -------------------------
+    # FP stacking
+    # -------------------------
     fp_ids = torch.stack([item["fp"]["input_ids"] for item in batch], dim=0)
     fp_attn = torch.stack([item["fp"]["attention_mask"] for item in batch], dim=0)
     fp_present = (fp_attn.sum(dim=1) > 0).cpu().numpy().tolist()
 
-    # PSMILES batching
+    # -------------------------
+    # PSMILES stacking
+    # -------------------------
     p_ids = torch.stack([item["psmiles"]["input_ids"] for item in batch], dim=0)
     p_attn = torch.stack([item["psmiles"]["attention_mask"] for item in batch], dim=0)
     psmiles_present = (p_attn.sum(dim=1) > 0).cpu().numpy().tolist()
@@ -943,6 +1026,7 @@ def multimodal_collate_fn(batch):
     # Target
     target = torch.stack([item["target"] for item in batch], dim=0)  # (B,)
 
+    # Presence mask for fusion (per-sample modality availability)
     modality_mask = {
         "gine": torch.tensor(gine_present, dtype=torch.bool),
         "schnet": torch.tensor(schnet_present, dtype=torch.bool),
@@ -977,13 +1061,17 @@ def multimodal_collate_fn(batch):
     }
 
 
-# -----------------------------
-# Property regression head (single task)
-# -----------------------------
-class UniPolyPropertyRegressor(nn.Module):
-    def __init__(self, unipoly_model: MultimodalContrastiveModel, emb_dim: int = UNIPOLY_EMB_DIM, dropout: float = 0.1):
+# =============================================================================
+# Single-task regressor head (Uni-Poly-style fine-tuning)
+# =============================================================================
+class PolyFPropertyRegressor(nn.Module):
+    """
+    Simple MLP head on top of the multimodal fused embedding.
+    Predicts one scalar (scaled target) per sample.
+    """
+    def __init__(self, polyf_model: MultimodalContrastiveModel, emb_dim: int = POLYF_EMB_DIM, dropout: float = 0.1):
         super().__init__()
-        self.unipoly = unipoly_model
+        self.polyf = polyf_model
         self.head = nn.Sequential(
             nn.Linear(emb_dim, emb_dim // 2),
             nn.ReLU(),
@@ -992,15 +1080,16 @@ class UniPolyPropertyRegressor(nn.Module):
         )
 
     def forward(self, batch_mods, modality_mask=None):
-        emb = self.unipoly(batch_mods, modality_mask=modality_mask)  # (B,d)
+        emb = self.polyf(batch_mods, modality_mask=modality_mask)  # (B,d)
         y = self.head(emb).squeeze(-1)  # (B,)
         return y
 
 
-# -----------------------------
-# Training / evaluation
-# -----------------------------
+# =============================================================================
+# Training / evaluation helpers
+# =============================================================================
 def compute_metrics(y_true, y_pred):
+    """Compute standard regression metrics in original units."""
     mse = mean_squared_error(y_true, y_pred)
     rmse = math.sqrt(mse)
     mae = mean_absolute_error(y_true, y_pred)
@@ -1009,11 +1098,13 @@ def compute_metrics(y_true, y_pred):
 
 
 def train_one_epoch(model, dataloader, optimizer, device):
+    """One epoch of supervised regression training (MSE loss)."""
     model.train()
     total_loss = 0.0
     total_n = 0
 
     for batch in dataloader:
+        # Move nested batch dict to device
         for k in batch:
             if k == "target":
                 batch[k] = batch[k].to(device)
@@ -1046,6 +1137,10 @@ def train_one_epoch(model, dataloader, optimizer, device):
 
 @torch.no_grad()
 def evaluate(model, dataloader, device):
+    """
+    Evaluate on a dataloader:
+      - returns avg loss, predicted scaled values, true scaled values
+    """
     model.eval()
     preds = []
     trues = []
@@ -1053,6 +1148,7 @@ def evaluate(model, dataloader, device):
     total_n = 0
 
     for batch in dataloader:
+        # Move nested batch dict to device
         for k in batch:
             if k == "target":
                 batch[k] = batch[k].to(device)
@@ -1088,26 +1184,37 @@ def evaluate(model, dataloader, device):
     return float(avg_loss), preds, trues
 
 
-# -----------------------------
-# Pretrained loading
-# -----------------------------
+# =============================================================================
+# Pretrained loading helpers
+# =============================================================================
 def load_pretrained_multimodal(pretrained_path: str) -> MultimodalContrastiveModel:
+    """
+    Construct modality encoders and load any available pretrained weights:
+      - modality-specific checkpoints (BEST_*_DIR)
+      - full multimodal checkpoint from `pretrained_path/pytorch_model.bin`
+
+    Returns a ready-to-fine-tune MultimodalContrastiveModel.
+    """
+    # -------------------------
+    # GINE encoder
+    # -------------------------
     gine_encoder = GineEncoder(
         node_emb_dim=NODE_EMB_DIM,
         edge_emb_dim=EDGE_EMB_DIM,
         num_layers=NUM_GNN_LAYERS,
         max_atomic_z=MAX_ATOMIC_Z
     )
-    if os.path.exists(os.path.join(BEST_GINE_DIR, "pytorch_model.bin")):
+    gine_ckpt = os.path.join(BEST_GINE_DIR, "pytorch_model.bin")
+    if os.path.exists(gine_ckpt):
         try:
-            gine_encoder.load_state_dict(
-                torch.load(os.path.join(BEST_GINE_DIR, "pytorch_model.bin"), map_location="cpu"),
-                strict=False
-            )
-            print(f"Loaded GINE weights from {BEST_GINE_DIR}")
+            gine_encoder.load_state_dict(torch.load(gine_ckpt, map_location="cpu"), strict=False)
+            print(f"[LOAD] GINE weights: {gine_ckpt}")
         except Exception as e:
-            print(f"Warning: Could not load GINE weights: {e}")
+            print(f"[LOAD][WARN] Could not load GINE weights: {e}")
 
+    # -------------------------
+    # SchNet encoder
+    # -------------------------
     schnet_encoder = NodeSchNetWrapper(
         hidden_channels=SCHNET_HIDDEN,
         num_interactions=SCHNET_NUM_INTERACTIONS,
@@ -1115,16 +1222,17 @@ def load_pretrained_multimodal(pretrained_path: str) -> MultimodalContrastiveMod
         cutoff=SCHNET_CUTOFF,
         max_num_neighbors=SCHNET_MAX_NEIGHBORS
     )
-    if os.path.exists(os.path.join(BEST_SCHNET_DIR, "pytorch_model.bin")):
+    sch_ckpt = os.path.join(BEST_SCHNET_DIR, "pytorch_model.bin")
+    if os.path.exists(sch_ckpt):
         try:
-            schnet_encoder.load_state_dict(
-                torch.load(os.path.join(BEST_SCHNET_DIR, "pytorch_model.bin"), map_location="cpu"),
-                strict=False
-            )
-            print(f"Loaded SchNet weights from {BEST_SCHNET_DIR}")
+            schnet_encoder.load_state_dict(torch.load(sch_ckpt, map_location="cpu"), strict=False)
+            print(f"[LOAD] SchNet weights: {sch_ckpt}")
         except Exception as e:
-            print(f"Warning: Could not load SchNet weights: {e}")
+            print(f"[LOAD][WARN] Could not load SchNet weights: {e}")
 
+    # -------------------------
+    # Fingerprint encoder
+    # -------------------------
     fp_encoder = FingerprintEncoder(
         vocab_size=VOCAB_SIZE_FP,
         hidden_dim=256,
@@ -1134,42 +1242,49 @@ def load_pretrained_multimodal(pretrained_path: str) -> MultimodalContrastiveMod
         dim_feedforward=1024,
         dropout=0.1
     )
-    if os.path.exists(os.path.join(BEST_FP_DIR, "pytorch_model.bin")):
+    fp_ckpt = os.path.join(BEST_FP_DIR, "pytorch_model.bin")
+    if os.path.exists(fp_ckpt):
         try:
-            fp_encoder.load_state_dict(
-                torch.load(os.path.join(BEST_FP_DIR, "pytorch_model.bin"), map_location="cpu"),
-                strict=False
-            )
-            print(f"Loaded fingerprint encoder weights from {BEST_FP_DIR}")
+            fp_encoder.load_state_dict(torch.load(fp_ckpt, map_location="cpu"), strict=False)
+            print(f"[LOAD] FP encoder weights: {fp_ckpt}")
         except Exception as e:
-            print(f"Warning: Could not load fingerprint weights: {e}")
+            print(f"[LOAD][WARN] Could not load fingerprint weights: {e}")
 
+    # -------------------------
+    # PSMILES encoder
+    # -------------------------
     psmiles_encoder = None
     if os.path.isdir(BEST_PSMILES_DIR):
         try:
             psmiles_encoder = PSMILESDebertaEncoder(model_dir_or_name=BEST_PSMILES_DIR)
-            print(f"Loaded PSMILES encoder from {BEST_PSMILES_DIR}")
+            print(f"[LOAD] PSMILES encoder: {BEST_PSMILES_DIR}")
         except Exception as e:
-            print(f"Warning: Could not load PSMILES encoder: {e}")
+            print(f"[LOAD][WARN] Could not load PSMILES encoder from dir: {e}")
 
+    # Fallback: initialize with vocab fallback (still functional, but not your finetuned weights)
     if psmiles_encoder is None:
         try:
             psmiles_encoder = PSMILESDebertaEncoder(
                 model_dir_or_name=None,
                 vocab_fallback=int(getattr(tokenizer, "vocab_size", 300))
             )
+            print("[LOAD] PSMILES encoder: initialized fallback (no pretrained dir).")
         except Exception as e:
-            print(f"Warning: Could not initialize PSMILES encoder: {e}")
+            print(f"[LOAD][WARN] Could not initialize PSMILES encoder: {e}")
 
+    # Build multimodal wrapper
     multimodal_model = MultimodalContrastiveModel(
         gine_encoder,
         schnet_encoder,
         fp_encoder,
         psmiles_encoder,
-        emb_dim=UNIPOLY_EMB_DIM,
+        emb_dim=POLYF_EMB_DIM,
         modalities=["gine", "schnet", "fp", "psmiles"]
     )
 
+    # -------------------------
+    # Optional: load full multimodal checkpoint (projects/fusion, etc.)
+    # -------------------------
     ckpt_path = os.path.join(pretrained_path, "pytorch_model.bin")
     if os.path.isfile(ckpt_path):
         try:
@@ -1185,26 +1300,34 @@ def load_pretrained_multimodal(pretrained_path: str) -> MultimodalContrastiveMod
 
             summarize_state_dict_load(state, model_state, filtered_state)
             missing, unexpected = multimodal_model.load_state_dict(filtered_state, strict=False)
-            print(f"[INFO] Loaded multimodal pretrained weights from {ckpt_path}")
-            print(f"[INFO] load_state_dict() -> missing={len(missing)} unexpected={len(unexpected)}")
+            print(f"[LOAD] Multimodal checkpoint: {ckpt_path}")
+            print(f"[LOAD] load_state_dict -> missing={len(missing)} unexpected={len(unexpected)}")
             if missing:
-                print("[INFO] Missing keys (sample):", missing[:50])
+                print("[LOAD] Missing keys (sample):", missing[:50])
             if unexpected:
-                print("[INFO] Unexpected keys (sample):", unexpected[:50])
+                print("[LOAD] Unexpected keys (sample):", unexpected[:50])
 
         except Exception as e:
-            print(f"Warning: Failed to load multimodal pretrained weights: {e}")
+            print(f"[LOAD][WARN] Failed to load multimodal pretrained weights: {e}")
+    else:
+        print(f"[LOAD] No multimodal checkpoint found at: {ckpt_path}")
 
     return multimodal_model
 
 
-# -----------------------------
-# Downstream run (Uni-Poly matched)
-# -----------------------------
+# =============================================================================
+# Downstream: sample construction + CV training loop
+# =============================================================================
 def build_samples_for_property(df: pd.DataFrame, prop_col: str) -> List[dict]:
+    """
+    Construct training samples for a single property:
+      - Keep rows that have at least one modality present.
+      - Keep rows with a finite property value in `prop_col`.
+      - Store raw target (will be scaled per fold).
+    """
     samples = []
     for _, row in df.iterrows():
-        # Require at least one modality
+        # Require at least one modality present
         has_modality = False
         for col in ['graph', 'geometry', 'fingerprints', 'psmiles']:
             if col in row and row[col] and str(row[col]).strip() != "":
@@ -1232,32 +1355,47 @@ def build_samples_for_property(df: pd.DataFrame, prop_col: str) -> List[dict]:
     return samples
 
 
-def run_unipoly_downstream(property_list: List[str], property_cols: List[str], df_raw: pd.DataFrame,
+def run_polyf_downstream(property_list: List[str], property_cols: List[str], df_raw: pd.DataFrame,
                            pretrained_path: str, output_file: str):
+    """
+    Uni-Poly-matched downstream evaluation:
+
+      For each property:
+        - Build samples from PolyInfo
+        - 5-fold CV:
+            - Split into trainval/test (by KFold)
+            - Split trainval into train/val
+            - Fit StandardScaler on train targets
+            - Fine-tune encoder+head end-to-end with early stopping by val loss
+            - Evaluate on held-out test fold in original units
+        - Save per-fold results and per-property mean±std
+        - Save best fold checkpoint bundle (by test R2) for later reuse
+    """
     os.makedirs(pretrained_path, exist_ok=True)
 
-    # Aggregate duplicates (Uni-Poly noise reduction) if possible
+    # Optional duplicate aggregation (noise reduction)
     modality_cols = ["graph", "geometry", "fingerprints", "psmiles"]
     df_proc = aggregate_polyinfo_duplicates(df_raw, modality_cols=modality_cols, property_cols=property_cols)
 
-    all_results = {"per_property": {}, "mode": "UNIPOLY_MATCHED_SINGLE_TASK"}
+    all_results = {"per_property": {}, "mode": "POLYF_MATCHED_SINGLE_TASK"}
 
-    # Load base pretrained model once per property-run (we reload inside each run to avoid leakage across runs)
     for pname, pcol in zip(property_list, property_cols):
-        print(f"\n=== Uni-Poly matched fine-tuning: {pname} (col='{pcol}') ===")
+        print(f"\n=== [DOWNSTREAM] Uni-Poly matched fine-tuning: {pname} (col='{pcol}') ===")
         samples = build_samples_for_property(df_proc, pcol)
+
+        print(f"[DATA] {pname}: n_samples={len(samples)}")
         if len(samples) < 200:
-            print(f"[WARN] Too few samples for '{pname}': {len(samples)}. Results may be unstable.")
+            print(f"[DATA][WARN] '{pname}' has <200 samples; results may be noisy.")
         if len(samples) < 50:
-            print(f"[WARN] Skipping '{pname}' due to insufficient samples.")
+            print(f"[DATA][WARN] Skipping '{pname}' (insufficient samples).")
             continue
 
         run_metrics = []
         run_records = []
 
-        # NEW: track which run ("fold") gives best performance and save its weights
+        # Track best-performing fold for this property (by test R2)
         best_overall_r2 = -1e18
-        best_overall_payload = None  # contains model_state_dict (cpu), scaler stats, and metadata
+        best_overall_payload = None
 
         idxs = np.arange(len(samples))
         cv = KFold(n_splits=NUM_RUNS, shuffle=True, random_state=42)
@@ -1266,10 +1404,12 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
             seed = 42 + run_idx
             set_seed(seed)
 
+            print(f"\n--- [CV] {pname}: fold {run_idx+1}/{NUM_RUNS} | seed={seed} ---")
+
             trainval = [copy.deepcopy(samples[i]) for i in trainval_idx]
             test = [copy.deepcopy(samples[i]) for i in test_idx]
 
-            # train/val split within trainval
+            # Split trainval into train/val
             tr_idx, va_idx = train_test_split(
                 np.arange(len(trainval)),
                 test_size=VAL_SIZE_WITHIN_TRAINVAL,
@@ -1279,7 +1419,7 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
             train = [copy.deepcopy(trainval[i]) for i in tr_idx]
             val = [copy.deepcopy(trainval[i]) for i in va_idx]
 
-            # Z-score normalization (StandardScaler) fit on train
+            # Standardize target using training fold only (prevents leakage)
             sc = StandardScaler()
             sc.fit(np.array([s["target_raw"] for s in train]).reshape(-1, 1))
 
@@ -1299,9 +1439,11 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
             dl_val = DataLoader(ds_val, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, collate_fn=multimodal_collate_fn)
             dl_test = DataLoader(ds_test, batch_size=BATCH_SIZE, shuffle=False, num_workers=2, pin_memory=True, collate_fn=multimodal_collate_fn)
 
-            # Load pretrained base, then attach Uni-Poly head; fine-tune end-to-end
-            unipoly_base = load_pretrained_multimodal(pretrained_path)
-            model = UniPolyPropertyRegressor(unipoly_base, emb_dim=UNIPOLY_EMB_DIM, dropout=UNIPOLY_DROPOUT).to(DEVICE)
+            print(f"[SPLIT] train={len(ds_train)} val={len(ds_val)} test={len(ds_test)}")
+
+            # Fresh base model per fold to avoid any cross-fold leakage
+            polyf_base = load_pretrained_multimodal(pretrained_path)
+            model = PolyFPropertyRegressor(polyf_base, emb_dim=POLYF_EMB_DIM, dropout=POLYF_DROPOUT).to(DEVICE)
 
             optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
@@ -1310,6 +1452,7 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
             best_state = None
             no_improve = 0
 
+            # Train with early stopping on validation loss
             for epoch in range(1, NUM_EPOCHS + 1):
                 tr_loss = train_one_epoch(model, dl_train, optimizer, DEVICE)
                 va_loss, _, _ = evaluate(model, dl_val, DEVICE)
@@ -1317,7 +1460,7 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
 
                 scheduler.step()
 
-                print(f"[{pname}] fold {run_idx+1}/{NUM_RUNS} epoch {epoch:03d}  train={tr_loss:.6f}  val={va_loss:.6f}")
+                print(f"[{pname}] fold {run_idx+1}/{NUM_RUNS} epoch {epoch:03d} | train={tr_loss:.6f} | val={va_loss:.6f}")
 
                 if va_loss < best_val - 1e-8:
                     best_val = va_loss
@@ -1326,24 +1469,28 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
                 else:
                     no_improve += 1
                     if no_improve >= PATIENCE:
-                        print(f"[{pname}] Early stopping at epoch {epoch} (patience={PATIENCE}).")
+                        print(f"[{pname}] fold {run_idx+1}: early stopping (patience={PATIENCE}) at epoch {epoch}.")
                         break
 
             if best_state is None:
-                print(f"[WARN] No best state saved for {pname} fold {run_idx+1}; skipping.")
+                print(f"[{pname}][WARN] No best checkpoint captured for fold {run_idx+1}; skipping fold.")
                 continue
 
+            # Restore best state and evaluate on test fold
             model.load_state_dict({k: v.to(DEVICE) for k, v in best_state.items()}, strict=True)
             _, pred_scaled, true_scaled = evaluate(model, dl_test, DEVICE)
             if pred_scaled is None:
+                print(f"[{pname}][WARN] Test evaluation returned empty predictions for fold {run_idx+1}.")
                 continue
 
-            # Inverse transform to original units
+            # Convert from scaled space back to original units
             pred = sc.inverse_transform(pred_scaled.reshape(-1, 1)).ravel()
             true = sc.inverse_transform(true_scaled.reshape(-1, 1)).ravel()
 
             m = compute_metrics(true, pred)
             run_metrics.append(m)
+
+            print(f"[{pname}] fold {run_idx+1} TEST | r2={m['r2']:.4f}  mae={m['mae']:.4f}  rmse={m['rmse']:.4f}")
 
             record = {
                 "property": pname,
@@ -1361,7 +1508,7 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
             with open(output_file, "a") as fh:
                 fh.write(json.dumps(make_json_serializable(record)) + "\n")
 
-            # NEW: if this run is best for the property (by test R2), keep its weights + scaler
+            # Update best fold bundle (by test R2)
             if float(m.get("r2", -1e18)) > float(best_overall_r2):
                 best_overall_r2 = float(m.get("r2", -1e18))
                 best_overall_payload = {
@@ -1378,20 +1525,16 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
                     "scaler_scale": make_json_serializable(getattr(sc, "scale_", None)),
                     "scaler_var": make_json_serializable(getattr(sc, "var_", None)),
                     "scaler_n_samples_seen": make_json_serializable(getattr(sc, "n_samples_seen_", None)),
-                    "model_state_dict": best_state,  # already CPU tensors
+                    "model_state_dict": best_state,  # CPU tensors
                 }
 
-        # NEW: save best run ("fold") weights for this property into a new directory
+        # Save best fold weights + metadata per property
         if best_overall_payload is not None and "model_state_dict" in best_overall_payload:
             os.makedirs(BEST_WEIGHTS_DIR, exist_ok=True)
             prop_dir = os.path.join(BEST_WEIGHTS_DIR, _sanitize_name(pname))
             os.makedirs(prop_dir, exist_ok=True)
 
-            # Save a single checkpoint bundle + a lightweight metadata json
-            ckpt_bundle = {
-                k: v for k, v in best_overall_payload.items()
-                if k != "test_metrics"
-            }
+            ckpt_bundle = {k: v for k, v in best_overall_payload.items() if k != "test_metrics"}
             ckpt_bundle["test_metrics"] = best_overall_payload["test_metrics"]
 
             torch.save(ckpt_bundle, os.path.join(prop_dir, "best_run_checkpoint.pt"))
@@ -1400,10 +1543,10 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
             with open(os.path.join(prop_dir, "best_run_metadata.json"), "w") as fh:
                 fh.write(json.dumps(make_json_serializable(meta), indent=2))
 
-            print(f"[INFO] Saved best weights for '{pname}' to: {prop_dir}")
-            print(f"[INFO]   best_run={best_overall_payload['best_run']}  best_test_r2={best_overall_payload['test_metrics'].get('r2', None)}")
+            print(f"[BEST] Saved best fold for '{pname}' -> {prop_dir}")
+            print(f"[BEST]   best_run={best_overall_payload['best_run']}  best_test_r2={best_overall_payload['test_metrics'].get('r2', None)}")
 
-        # Aggregate across runs
+        # Aggregate metrics across folds
         if run_metrics:
             r2s = [x["r2"] for x in run_metrics]
             maes = [x["mae"] for x in run_metrics]
@@ -1415,8 +1558,10 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
                 "rmse": {"mean": float(np.mean(rmses)), "std": float(np.std(rmses, ddof=0))},
                 "mse": {"mean": float(np.mean(mses)), "std": float(np.std(mses, ddof=0))},
             }
+            print(f"[AGG] {pname} | r2={agg['r2']['mean']:.4f}±{agg['r2']['std']:.4f}  mae={agg['mae']['mean']:.4f}±{agg['mae']['std']:.4f}")
         else:
             agg = None
+            print(f"[AGG][WARN] No successful folds for '{pname}' (no aggregate computed).")
 
         all_results["per_property"][pname] = {
             "property_col": pcol,
@@ -1431,38 +1576,42 @@ def run_unipoly_downstream(property_list: List[str], property_cols: List[str], d
     return all_results
 
 
-# -----------------------------
+# =============================================================================
 # Main
-# -----------------------------
+# =============================================================================
 def main():
+    # Start a fresh results file (back up old results if present)
     if os.path.exists(OUTPUT_RESULTS):
         backup = OUTPUT_RESULTS + ".bak"
         shutil.copy(OUTPUT_RESULTS, backup)
-        print(f"[INFO] Existing {OUTPUT_RESULTS} backed up to {backup}")
+        print(f"[INIT] Existing results backed up: {backup}")
     open(OUTPUT_RESULTS, "w").close()
+    print(f"[INIT] Writing results to: {OUTPUT_RESULTS}")
 
+    # Load PolyInfo
     if not os.path.isfile(POLYINFO_PATH):
         raise FileNotFoundError(f"PolyInfo file not found at {POLYINFO_PATH}")
     polyinfo_raw = pd.read_csv(POLYINFO_PATH, engine="python")
+    print(f"[DATA] Loaded PolyInfo: n_rows={len(polyinfo_raw)} n_cols={len(polyinfo_raw.columns)}")
 
+    # Map requested properties to dataframe columns
     found = find_property_columns(polyinfo_raw.columns)
     prop_map = {req: col for req, col in found.items()}
-    print(f"[INFO] Property-to-column map: {prop_map}")
+    print(f"[COLMAP] Property-to-column map: {prop_map}")
 
     property_list = []
     property_cols = []
     for req in REQUESTED_PROPERTIES:
         col = prop_map.get(req)
         if col is None:
-            print(f"[WARN] Could not find a column for requested property '{req}'. Skipping.")
+            print(f"[COLMAP][WARN] Could not find a column for '{req}'; skipping.")
             continue
         property_list.append(req)
         property_cols.append(col)
 
-    print(f"\n=== Running Uni-Poly MATCHED downstream fine-tuning for properties: {property_list} ===")
-    overall = run_unipoly_downstream(property_list, property_cols, polyinfo_raw, PRETRAINED_MULTIMODAL_DIR, OUTPUT_RESULTS)
+    overall = run_polyf_downstream(property_list, property_cols, polyinfo_raw, PRETRAINED_MULTIMODAL_DIR, OUTPUT_RESULTS)
 
-    # Write final summary (aggregated per property)
+    # Write final summary (aggregated per property) 
     final_agg = {}
     if overall and "per_property" in overall:
         for pname, info in overall["per_property"].items():
@@ -1473,7 +1622,8 @@ def main():
         fh.write(json.dumps(make_json_serializable(final_agg), indent=2))
         fh.write("\n")
 
-    print(f"\n[DONE] Results appended to {OUTPUT_RESULTS}")
+    print(f"\n Results appended to: {OUTPUT_RESULTS}")
+    print(f" Best checkpoints saved under: {BEST_WEIGHTS_DIR}")
 
 
 if __name__ == "__main__":
