@@ -1,3 +1,17 @@
+"""
+PolyAgent Orchestrator (5M)
+===========================
+
+This file provides a modular orchestrator that:
+  - extracts polymer multimodal data (graph/geometry/fingerprints/PSMILES)
+  - encodes CL embeddings using PolyFusion encoders
+  - predicts single properties using best downstream heads
+  - performs inverse design using a CL-conditioned SELFIES-TED generator
+  - retrieves literature via local RAG + web APIs
+  - visualizes polymer renderings and explainability maps
+  - composes a final response along with verbatim tool outputs
+"""
+
 import os
 import re
 import json
@@ -6,7 +20,7 @@ import sys
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse
-from typing import Optional
+
 import numpy as np
 import torch
 import torch.nn as nn
@@ -47,7 +61,7 @@ try:
 except Exception:
     spm = None
 
-# Optional: selfies (for SELFIES→SMILES/PSMILES conversion, as in G2)
+# Optional: selfies (for SELFIES→SMILES/PSMILES conversion)
 try:
     import selfies as sf
 except Exception:
@@ -58,9 +72,34 @@ SELFIES_AVAILABLE = sf is not None
 
 
 # =============================================================================
+# PATHS / CONFIGURATION 
+# =============================================================================
+class PathsConfig:
+    """
+    Centralized path placeholders. Replace these with your local paths.
+    """
+    # CL weights 
+    cl_weights_path = "/path/to/multimodal_output_5M/best/pytorch_model.bin"
+
+    # Chroma DB (local RAG vectorstore persist dir)
+    chroma_db_path = "/path/to/chroma_polymer_db_big"
+
+    # SentencePiece model + vocab 
+    spm_model_path = "/path/to/spm_5M.model"
+    spm_vocab_path = "/path/to/spm_5M.vocab"
+
+    # Downstream bestweights directory produced by your 5M downstream script
+    downstream_bestweights_5m_dir = "/path/to/multimodal_downstream_bestweights_5M"
+
+    # Inverse-design generator artifacts directory produced by your 5M inverse design run
+    inverse_design_5m_dir = "/path/to/multimodal_inverse_design_output_5M_polybart_style/best_models"
+
+
+# =============================================================================
 # DOI NORMALIZATION / RESOLUTION HELPERS
 # =============================================================================
 _DOI_RE = re.compile(r"^10\.\d{4,9}/\S+$", re.IGNORECASE)
+
 
 def normalize_doi(raw: str) -> Optional[str]:
     if not isinstance(raw, str):
@@ -75,9 +114,11 @@ def normalize_doi(raw: str) -> Optional[str]:
     s = s.rstrip(").,;]}")
     return s if _DOI_RE.match(s) else None
 
+
 def doi_to_url(doi: str) -> str:
     # doi is assumed normalized
     return f"https://doi.org/{doi}"
+
 
 def doi_resolves(doi_url: str, timeout: float = 6.0) -> bool:
     """
@@ -95,8 +136,9 @@ def doi_resolves(doi_url: str, timeout: float = 6.0) -> bool:
     except Exception:
         return False
 
+
 # =============================================================================
-# CITATION / DOMAIN TAGGING HELPERS (domain-style citations like "(nature.com)")
+# CITATION / DOMAIN TAGGING HELPERS
 # =============================================================================
 def _url_to_domain(url: str) -> Optional[str]:
     if not isinstance(url, str) or not url.strip():
@@ -133,10 +175,12 @@ def _url_to_domain(url: str) -> Optional[str]:
     except Exception:
         return None
 
+
 def _attach_source_domains(obj: Any) -> Any:
     """
     Recursively add a short source_domain field where URLs are present.
-    This enables domain-style citations like "(nature.com)".
+    This enables domain-style citations like "(nature.com)" (note: the composer
+    later enforces DOI-URL bracket citations for papers).
     """
     if isinstance(obj, list):
         return [_attach_source_domains(x) for x in obj]
@@ -160,6 +204,7 @@ def _attach_source_domains(obj: Any) -> Any:
 def _index_citable_sources(report: Dict[str, Any]) -> Dict[str, Any]:
     """
     Add 'cite_tag' fields for citable web/RAG items using DOI-first URL tags.
+
     Requirement:
       - Paper citations must use the COMPLETE DOI URL (https://doi.org/...) as the bracket text.
       - If DOI is not available, fall back to the best http(s) URL.
@@ -181,7 +226,7 @@ def _index_citable_sources(report: Dict[str, Any]) -> Dict[str, Any]:
         return False
 
     def get_best_url(d: Dict[str, Any]) -> Optional[str]:
-        # DOI-first: if DOI exists, ALWAYS prefer doi.org for citation link text and href.
+        # DOI-first
         doi = normalize_doi(d.get("doi", ""))
         if doi:
             return doi_to_url(doi)
@@ -199,23 +244,16 @@ def _index_citable_sources(report: Dict[str, Any]) -> Dict[str, Any]:
             out = {k: walk_and_tag(v) for k, v in node.items()}
 
             if is_citable_item(out):
-                # Citation tag MUST be DOI URL (preferred) or best URL (fallback).
                 url = get_best_url(out)
                 if isinstance(url, str) and url.startswith(("http://", "https://")):
-                    # If an existing cite_tag is non-URL (e.g., a domain tag), replace it.
                     cur = out.get("cite_tag")
                     if not (isinstance(cur, str) and cur.strip().startswith(("http://", "https://"))):
                         out["cite_tag"] = url.strip()
-                else:
-                    # If we cannot form a URL, leave as-is (should be rare due to is_citable_item).
-                    pass
 
-                # Maintain a compact index (optional, harmless for UIs)
                 url = get_best_url(out)
                 dom = out.get("source_domain") or (_url_to_domain(url) if url else None) or "source"
                 citation_index["sources"].append(
                     {
-                        # tag is the bracket text requirement (DOI URL or URL)
                         "tag": out.get("cite_tag") if isinstance(out.get("cite_tag"), str) else url,
                         "domain": dom,
                         "title": out.get("title") or out.get("name") or "Untitled",
@@ -236,10 +274,9 @@ def _index_citable_sources(report: Dict[str, Any]) -> Dict[str, Any]:
     return report
 
 
-
- # =============================================================================
- # ENFORCE INLINE CLICKABLE LITERATURE CITATIONS (distributed, not clustered)
- # =============================================================================
+# =============================================================================
+# INLINE CITATION ENFORCERS (distributed, deduped, DOI-first)
+# =============================================================================
 _CITE_COUNT_PATTERNS = [
     r"(?:at\s+least\s+)?(\d{1,3})\s*(?:citations|citation|papers|paper|sources|source|references|reference)\b",
     r"\bcite\s+(\d{1,3})\s*(?:papers|paper|sources|source|references|reference|citations|citation)\b",
@@ -262,8 +299,8 @@ def _infer_required_citation_count(text: str, default_n: int = 10) -> int:
 
 def _collect_citation_links_from_report(report: Dict[str, Any]) -> List[Tuple[str, str]]:
     """
-    Return unique (domain, url) pairs from report['citation_index']['sources'].
-    Link text is strictly the root domain. URL must be http(s).
+    Return unique (cite_text, url) pairs from report['citation_index']['sources'].
+    cite_text is strictly the DOI URL (preferred) or URL fallback.
     """
     out: List[Tuple[str, str]] = []
     seen: set = set()
@@ -280,7 +317,6 @@ def _collect_citation_links_from_report(report: Dict[str, Any]) -> List[Tuple[st
         url = s.get("url")
         if not isinstance(url, str) or not url.startswith(("http://", "https://")):
             continue
-        # cite_text is DOI URL (tag) if present; else fall back to the URL itself.
         cite_text = s.get("tag") if isinstance(s.get("tag"), str) and s.get("tag").strip() else url
         if not isinstance(cite_text, str) or not cite_text.strip():
             cite_text = url
@@ -310,18 +346,15 @@ def _ensure_distributed_inline_citations(md: str, report: Dict[str, Any], min_ne
     if not citations:
         return md
 
-    # Count existing literature links by URL (any markdown link).
     existing_urls = set(re.findall(r"\[[^\]]+\]\((https?://[^)]+)\)", md))
     need = max(0, int(min_needed) - len(existing_urls))
     if need <= 0:
         return md
 
-    # Only use citations not already present.
     remaining: List[Tuple[str, str]] = [(d, u) for (d, u) in citations if u not in existing_urls]
     if not remaining:
         return md
 
-    # Split by fenced code blocks; do not inject inside them.
     parts = re.split(r"(```[\s\S]*?```)", md)
     rem_i = 0
 
@@ -331,7 +364,6 @@ def _ensure_distributed_inline_citations(md: str, report: Dict[str, Any], min_ne
         if part.startswith("```") and part.endswith("```"):
             continue
 
-        # Split into paragraph blocks (preserve blank-line separators).
         segs = re.split(r"(\n\s*\n)", part)
         for si in range(0, len(segs), 2):
             if rem_i >= len(remaining) or need <= 0:
@@ -339,27 +371,24 @@ def _ensure_distributed_inline_citations(md: str, report: Dict[str, Any], min_ne
             para = segs[si]
             if not isinstance(para, str) or not para.strip():
                 continue
-            # Skip headings.
             if para.lstrip().startswith("#"):
                 continue
-            # Skip paragraphs that already contain at least one markdown link.
             if re.search(r"\[[^\]]+\]\((https?://[^)]+)\)", para):
                 continue
-
-            # Prefer injecting into evidence-bearing paragraphs first to avoid "clutter".
-            # If paragraph doesn't look like a literature-backed claim, skip it in this pass.
-            if not re.search(r"\b(reported|shown|demonstrated|study|studies|literature|evidence|review|according)\b", para, flags=re.IGNORECASE):
+            if not re.search(
+                r"\b(reported|shown|demonstrated|study|studies|literature|evidence|review|according)\b",
+                para,
+                flags=re.IGNORECASE,
+            ):
                 continue
 
             cite_text, url = remaining[rem_i]
-            # Requirement: bracket text is the COMPLETE DOI URL (or URL fallback).
             segs[si] = para.rstrip() + f" [{cite_text}]({url})"
             rem_i += 1
             need -= 1
 
         parts[pi] = "".join(segs)
 
-    # Second pass (if still need citations): allow any non-heading paragraph without links.
     if need > 0 and rem_i < len(remaining):
         md2 = "".join(parts)
         parts2 = re.split(r"(```[\s\S]*?```)", md2)
@@ -391,9 +420,9 @@ def _ensure_distributed_inline_citations(md: str, report: Dict[str, Any], min_ne
 
 def _normalize_and_dedupe_literature_links(md: str, report: Dict[str, Any]) -> str:
     """
-    Enforce the single citation requirement:
-      - Link text must be the COMPLETE DOI URL (preferred) or URL fallback.
-      - Each DOI/URL must appear at most once in the entire answer.
+    Enforce:
+      - Link text must be COMPLETE DOI URL (preferred) or URL fallback.
+      - Each DOI/URL appears at most once in the answer.
     Only operates outside fenced code blocks.
     """
     if not isinstance(md, str) or not md.strip():
@@ -401,7 +430,6 @@ def _normalize_and_dedupe_literature_links(md: str, report: Dict[str, Any]) -> s
     if not isinstance(report, dict):
         return md
 
-    # Build url -> preferred_text mapping (DOI URL / URL)
     url_to_text: Dict[str, str] = {}
     ci = report.get("citation_index", {})
     sources = ci.get("sources") if isinstance(ci, dict) else None
@@ -421,22 +449,19 @@ def _normalize_and_dedupe_literature_links(md: str, report: Dict[str, Any]) -> s
 
     def _rewrite_and_dedupe(text: str) -> str:
         def repl(m: re.Match) -> str:
-            txt = m.group(1)
             url = m.group(2).strip()
             if url in seen_urls:
-                # remove duplicate citation entirely (and any leading space before it if present)
                 return ""
             seen_urls.add(url)
             pref = url_to_text.get(url, url)
             return f"[{pref}]({url})"
-        # Rewrite link text to preferred, then dedupe by URL
+
         return re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", repl, text)
 
     for i, part in enumerate(parts):
         if part.startswith("```") and part.endswith("```"):
             continue
         parts[i] = _rewrite_and_dedupe(part)
-        # Cleanup: collapse double spaces created by removals
         parts[i] = re.sub(r"[ \t]{2,}", " ", parts[i])
         parts[i] = re.sub(r"\n{3,}", "\n\n", parts[i])
 
@@ -446,7 +471,6 @@ def _normalize_and_dedupe_literature_links(md: str, report: Dict[str, Any]) -> s
 def autolink_doi_urls(md: str) -> str:
     """
     Wrap bare DOI URLs in Markdown links outside code blocks.
-    Prevents plain DOI URLs from rendering as non-clickable text.
     """
     if not md:
         return md
@@ -457,15 +481,18 @@ def autolink_doi_urls(md: str) -> str:
         parts[i] = re.sub(
             r"(?<!\]\()(?P<u>https?://doi\.org/10\.\d{4,9}/[^\s\)\],;]+)",
             lambda m: f"[{m.group('u')}]({m.group('u')})",
-           part,
+            part,
             flags=re.IGNORECASE,
         )
     return "".join(parts)
 
+
+# =============================================================================
+# TOOL TAGS + VERBATIM TOOL OUTPUT RENDERER
+# =============================================================================
 def _assign_tool_tags_to_report(report: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Ensure each tool output has a [T#] tag for tool-citation style.
-    This does NOT modify tool outputs beyond adding a 'cite_tag' key when missing.
+    Ensure each tool output has a [T] cite tag.
     """
     if not isinstance(report, dict):
         return report
@@ -474,8 +501,7 @@ def _assign_tool_tags_to_report(report: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(tool_outputs, dict):
         return report
 
-    # Stable order (common core tools first)
-    ordered_tools = [
+    preferred = [
         "data_extraction",
         "cl_encoding",
         "property_prediction",
@@ -485,12 +511,10 @@ def _assign_tool_tags_to_report(report: Dict[str, Any]) -> Dict[str, Any]:
         "report_generation",
     ]
 
-    # Tag assignment: keep existing cite_tags if present
     tool_tag_map: Dict[str, str] = {}
     tag = "[T]"
 
-    # First pass: assign in preferred order
-    for tool in ordered_tools:
+    for tool in preferred:
         node = tool_outputs.get(tool)
         if node is None:
             continue
@@ -498,7 +522,6 @@ def _assign_tool_tags_to_report(report: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(node, dict) and not node.get("cite_tag"):
             node["cite_tag"] = tag
 
-    # Second pass: any remaining tools in tool_outputs
     for tool, node in tool_outputs.items():
         if tool in tool_tag_map or node is None:
             continue
@@ -506,11 +529,9 @@ def _assign_tool_tags_to_report(report: Dict[str, Any]) -> Dict[str, Any]:
         if isinstance(node, dict) and not node.get("cite_tag"):
             node["cite_tag"] = tag
 
-    # Also tag summary nodes (best-effort, no structural assumptions)
     try:
         summary = report.get("summary", {}) or {}
         if isinstance(summary, dict):
-            # common mapping
             key_to_tool = {
                 "data_extraction": "data_extraction",
                 "cl_encoding": "cl_encoding",
@@ -534,7 +555,7 @@ def _assign_tool_tags_to_report(report: Dict[str, Any]) -> Dict[str, Any]:
 
 def _render_tool_outputs_verbatim_md(report: Dict[str, Any]) -> str:
     """
-    Render tool outputs as verbatim JSON blocks (no tweaking of content values).
+    Render tool outputs as verbatim JSON blocks (no content rewriting).
     """
     if not isinstance(report, dict):
         return ""
@@ -543,7 +564,6 @@ def _render_tool_outputs_verbatim_md(report: Dict[str, Any]) -> str:
     if not isinstance(tool_outputs, dict):
         return ""
 
-    # Prefer a stable display order; include any extra keys afterward
     preferred = [
         "data_extraction",
         "cl_encoding",
@@ -571,28 +591,19 @@ def _render_tool_outputs_verbatim_md(report: Dict[str, Any]) -> str:
 
 
 # =============================================================================
-# PICKLE / JOBLIB COMPATIBILITY SHIMS (Fix generator loading error)
+# PICKLE / JOBLIB COMPATIBILITY SHIMS
 # =============================================================================
 class LatentPropertyModel:
     """
     Compatibility shim for joblib/pickle artifacts saved with references like:
       __main__.LatentPropertyModel
-
-    The original training code likely defined this in a script, so pickle recorded it under __main__.
-    When loading from Gradio, __main__ is different, so unpickling fails.
-
-    This shim is intentionally minimal:
-      - pickle will restore attributes into this object
-      - predict(...) attempts to delegate to a plausible underlying model attribute if present
     """
     def predict(self, X):
-        # Common patterns: wrapper stores underlying estimator under one of these attributes.
         for attr in ("model", "gpr", "gpr_model", "estimator", "predictor", "_model", "_gpr"):
             if hasattr(self, attr):
                 obj = getattr(self, attr)
                 if hasattr(obj, "predict"):
                     return obj.predict(X)
-        # If the wrapper itself has been restored with a custom predict, this will never be hit.
         raise AttributeError(
             "LatentPropertyModel shim could not find an underlying predictor. "
             "Artifact expects a wrapped model attribute with a .predict method."
@@ -602,7 +613,6 @@ class LatentPropertyModel:
 def _install_unpickle_shims() -> None:
     """
     Ensure that any classes pickled under __main__ are available at load time.
-    This is critical for joblib artifacts created from scripts (training/fit scripts).
     """
     main_mod = sys.modules.get("__main__")
     if main_mod is not None and not hasattr(main_mod, "LatentPropertyModel"):
@@ -620,7 +630,6 @@ def _safe_joblib_load(path: str):
         return joblib.load(path)
     except Exception as e:
         msg = str(e)
-        # Targeted fix for your exact failure mode
         if "Can't get attribute 'LatentPropertyModel' on <module '__main__'" in msg:
             _install_unpickle_shims()
             return joblib.load(path)
@@ -628,18 +637,50 @@ def _safe_joblib_load(path: str):
 
 
 # =============================================================================
-# PATHS (per your 5M pipeline artifacts)
+# PROPERTY + GENERATOR REGISTRY
 # =============================================================================
-DOWNSTREAM_BESTWEIGHTS_5M_DIR = "/home/kaur-m43/multimodal_downstream_bestweights_5M"
-INVERSE_DESIGN_5M_DIR = "/home/kaur-m43/multimodal_inverse_design_output_5M_polybart_style/best_models"
+def build_property_registries(paths: PathsConfig):
+    """
+    Build registry dicts for:
+      - downstream property heads (checkpoint + metadata)
+      - inverse-design generator directories
+    """
+    downstream = paths.downstream_bestweights_5m_dir
+    invgen = paths.inverse_design_5m_dir
+
+    PROPERTY_HEAD_PATHS = {
+        "density": os.path.join(downstream, "density", "best_run_checkpoint.pt"),
+        "glass transition": os.path.join(downstream, "glass_transition", "best_run_checkpoint.pt"),
+        "melting": os.path.join(downstream, "melting", "best_run_checkpoint.pt"),
+        "specific volume": os.path.join(downstream, "specific_volume", "best_run_checkpoint.pt"),
+        "thermal decomposition": os.path.join(downstream, "thermal_decomposition", "best_run_checkpoint.pt"),
+    }
+
+    PROPERTY_HEAD_META = {
+        "density": os.path.join(downstream, "density", "best_run_metadata.json"),
+        "glass transition": os.path.join(downstream, "glass_transition", "best_run_metadata.json"),
+        "melting": os.path.join(downstream, "melting", "best_run_metadata.json"),
+        "specific volume": os.path.join(downstream, "specific_volume", "best_run_metadata.json"),
+        "thermal decomposition": os.path.join(downstream, "thermal_decomposition", "best_run_metadata.json"),
+    }
+
+    GENERATOR_DIRS = {
+        "density": os.path.join(invgen, "density"),
+        "glass transition": os.path.join(invgen, "glass_transition"),
+        "melting": os.path.join(invgen, "melting"),
+        "specific volume": os.path.join(invgen, "specific_volume"),
+        "thermal decomposition": os.path.join(invgen, "thermal_decomposition"),
+    }
+
+    return PROPERTY_HEAD_PATHS, PROPERTY_HEAD_META, GENERATOR_DIRS
 
 
 # =============================================================================
-# Property name canonicalization
+# Property name canonicalization + inference helpers
 # =============================================================================
 def canonical_property_name(name: str) -> str:
     """
-    Map user/tool inputs to the canonical keys used in PROPERTY_HEAD_PATHS/GENERATOR_DIRS.
+    Map user/tool inputs to the canonical keys used in registries.
     """
     if not isinstance(name, str):
         return ""
@@ -663,15 +704,11 @@ def canonical_property_name(name: str) -> str:
     return aliases.get(s, s)
 
 
-# =============================================================================
-# NEW: best-effort inference of property + target_value from questions text
-# (used only when callers omit property/target_value but provide questions)
-# =============================================================================
 _NUM_RE = r"[-+]?\d+(?:\.\d+)?"
+
 
 def infer_property_from_text(text: str) -> Optional[str]:
     s = (text or "").lower()
-    # explicit "property: ..."
     m = re.search(r"\bproperty\b\s*[:=]\s*([a-zA-Z _-]+)", s)
     if m:
         cand = m.group(1).strip().lower()
@@ -697,6 +734,7 @@ def infer_property_from_text(text: str) -> Optional[str]:
     if "density" in s or re.search(r"\brho\b", s):
         return "density"
     return None
+
 
 def infer_target_value_from_text(text: str, prop: Optional[str]) -> Optional[float]:
     sl = (text or "").lower()
@@ -729,7 +767,6 @@ def infer_target_value_from_text(text: str, prop: Optional[str]) -> Optional[flo
             except Exception:
                 pass
 
-    # token-near-number fallback (within 80 chars)
     tokens = []
     if prop == "glass transition":
         tokens = ["tg", "glass transition"]
@@ -754,33 +791,9 @@ def infer_target_value_from_text(text: str, prop: Optional[str]) -> Optional[flo
 
     return None
 
-PROPERTY_HEAD_PATHS = {
-    "density": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "density", "best_run_checkpoint.pt"),
-    "glass transition": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "glass_transition", "best_run_checkpoint.pt"),
-    "melting": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "melting", "best_run_checkpoint.pt"),
-    "specific volume": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "specific_volume", "best_run_checkpoint.pt"),
-    "thermal decomposition": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "thermal_decomposition", "best_run_checkpoint.pt"),
-}
-
-PROPERTY_HEAD_META = {
-    "density": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "density", "best_run_metadata.json"),
-    "glass transition": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "glass_transition", "best_run_metadata.json"),
-    "melting": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "melting", "best_run_metadata.json"),
-    "specific volume": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "specific_volume", "best_run_metadata.json"),
-    "thermal decomposition": os.path.join(DOWNSTREAM_BESTWEIGHTS_5M_DIR, "thermal_decomposition", "best_run_metadata.json"),
-}
-
-GENERATOR_DIRS = {
-    "density": os.path.join(INVERSE_DESIGN_5M_DIR, "density"),
-    "glass transition": os.path.join(INVERSE_DESIGN_5M_DIR, "glass_transition"),
-    "melting": os.path.join(INVERSE_DESIGN_5M_DIR, "melting"),
-    "specific volume": os.path.join(INVERSE_DESIGN_5M_DIR, "specific_volume"),
-    "thermal decomposition": os.path.join(INVERSE_DESIGN_5M_DIR, "thermal_decomposition"),
-}
-
 
 # =============================================================================
-# Tokenizers (SentencePiece etc. — kept for backward compatibility)
+# Tokenizers
 # =============================================================================
 class SimpleCharTokenizer:
     def __init__(self, vocab_chars: List[str], special_tokens=("<pad>", "<s>", "</s>", "<unk>")):
@@ -840,7 +853,6 @@ class SentencePieceTokenizerWrapper:
                 blocked.append(tid)
         setattr(self, "_blocked_ids", blocked)
 
-        # Safety: require '*' token
         if self.PieceToId("*") is None:
             raise RuntimeError("SentencePiece tokenizer loaded but '*' token not found – aborting for safe PSMILES generation.")
 
@@ -878,16 +890,18 @@ def psmiles_to_rdkit_smiles(psmiles: str) -> str:
         s = re.sub(r"\*", "[*]", s)
     return s
 
-# --- UI-safe endpoint normalization (ONLY [At]/[AT] -> [*]) ---
+
 _AT_BRACKET_UI_RE = re.compile(r"\[(at)\]", flags=re.IGNORECASE)
+
 
 def replace_at_with_star(psmiles: str) -> str:
     if not isinstance(psmiles, str) or not psmiles:
         return psmiles
     return _AT_BRACKET_UI_RE.sub("[*]", psmiles)
 
+
 # =============================================================================
-# SELFIES utilities (minimal subset mirroring G2.py behaviour)
+# SELFIES utilities
 # =============================================================================
 _SELFIES_TOKEN_RE = re.compile(r"\[[^\[\]]+\]")
 
@@ -933,32 +947,25 @@ def selfies_to_smiles(selfies_str: str) -> str:
 def pselfies_to_psmiles(selfies_str: str) -> str:
     """
     For this orchestrator we treat pSELFIES→PSMILES as SELFIES→canonical SMILES.
-    The G2 training script used a more elaborate At/[*] polymer mapping; if you
-    want that exact behaviour, you can replace this with the full pselfies_to_psmiles
-    utilities from G2.py.
     """
     return selfies_to_smiles(selfies_str)
 
 
 # =============================================================================
-# SELFIES-TED decoder (as in G2.py, but simplified to core functionality)
+# SELFIES-TED decoder
 # =============================================================================
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
 SELFIES_TED_MODEL_NAME = os.environ.get("SELFIES_TED_MODEL_NAME", "ibm-research/materials.selfies-ted")
 
-# Generation hyperparameters (mirroring G2 defaults)
 GEN_MAX_LEN = 256
 GEN_MIN_LEN = 10
 GEN_TOP_P = 0.92
 GEN_TEMPERATURE = 1.0
 GEN_REPETITION_PENALTY = 1.05
-LATENT_NOISE_STD_GEN = 0.15   # default exploration std for generation
+LATENT_NOISE_STD_GEN = 0.15
 
 
 def _hf_load_with_retries(load_fn, max_tries: int = 5, base_sleep: float = 2.0):
-    """
-    Small helper to make HF loading more robust, copied from G2 spirit.
-    """
     import time
     last_err = None
     for t in range(max_tries):
@@ -974,7 +981,7 @@ def _hf_load_with_retries(load_fn, max_tries: int = 5, base_sleep: float = 2.0):
 
 def load_selfies_ted_and_tokenizer(model_name: str = SELFIES_TED_MODEL_NAME):
     """
-    Load tokenizer + seq2seq model for SELFIES-TED, exactly as in G2.py (but without side effects).
+    Load tokenizer + seq2seq model for SELFIES-TED.
     """
     def _load_tok():
         return AutoTokenizer.from_pretrained(model_name, token=HF_TOKEN, use_fast=True)
@@ -989,8 +996,7 @@ def load_selfies_ted_and_tokenizer(model_name: str = SELFIES_TED_MODEL_NAME):
 
 class CLConditionedSelfiesTEDGenerator(nn.Module):
     """
-    Same structure as in G2.py: take a CL embedding (latent) and project it
-    into a fixed-length memory that conditions a SELFIES-TED seq2seq model.
+    CL embedding (latent) -> fixed-length memory -> conditions SELFIES-TED seq2seq.
     """
     def __init__(self, tok, seq2seq_model, cl_emb_dim: int = 600, mem_len: int = 4):
         super().__init__()
@@ -1038,9 +1044,6 @@ class CLConditionedSelfiesTEDGenerator(nn.Module):
         temperature: float = GEN_TEMPERATURE,
         repetition_penalty: float = GEN_REPETITION_PENALTY,
     ) -> List[str]:
-        """
-        Latent→pSELFIES generation, as in G2.
-        """
         self.eval()
         z = z.to(next(self.parameters()).device)
         enc_out, attn = self.build_encoder_outputs(z)
@@ -1063,25 +1066,17 @@ class CLConditionedSelfiesTEDGenerator(nn.Module):
 
 
 # =============================================================================
-# Latent→property helper (uses G2-style LatentPropertyModel joblib artifacts)
+# Latent -> property helper
 # =============================================================================
 def _predict_latent_property(latent_model: Any, z: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Mirror G2's predict_latent_property(model, z):
-      - PCA transform if present
-      - GPR predict (scaled y)
-      - inverse-transform via y_scaler if present
-    """
     z_use = np.asarray(z, dtype=np.float32)
     if z_use.ndim == 1:
         z_use = z_use.reshape(1, -1)
 
-    # Optional PCA
     pca = getattr(latent_model, "pca", None)
     if pca is not None:
         z_use = pca.transform(z_use.astype(np.float32))
 
-    # GPR or wrapped predictor
     gpr = getattr(latent_model, "gpr", None)
     if gpr is not None and hasattr(gpr, "predict"):
         y_s = gpr.predict(z_use)
@@ -1092,7 +1087,6 @@ def _predict_latent_property(latent_model: Any, z: np.ndarray) -> Tuple[np.ndarr
 
     y_s = np.array(y_s, dtype=np.float32).reshape(-1)
 
-    # Optional scaler to get back to original units
     y_scaler = getattr(latent_model, "y_scaler", None)
     if y_scaler is not None and hasattr(y_scaler, "inverse_transform"):
         y_u = y_scaler.inverse_transform(y_s.reshape(-1, 1)).reshape(-1)
@@ -1103,7 +1097,7 @@ def _predict_latent_property(latent_model: Any, z: np.ndarray) -> Tuple[np.ndarr
 
 
 # =============================================================================
-# Legacy models (kept for backward compatibility; not used in new generation path)
+# Legacy models
 # =============================================================================
 class TransformerDecoderOnly(nn.Module):
     def __init__(
@@ -1197,21 +1191,23 @@ class InverseDesignDecoder(nn.Module):
 
 
 # =============================================================================
-# Config
+# Orchestrator config
 # =============================================================================
 class OrchestratorConfig:
-    def __init__(self):
+    def __init__(self, paths: Optional[PathsConfig] = None):
+        self.paths = paths or PathsConfig()
+
         self.base_dir = "."
-        self.cl_weights_path = "/home/kaur-m43/multimodal_output_5M/best/pytorch_model.bin"
-        self.chroma_db_path = "chroma_polymer_db_big"
+        self.cl_weights_path = self.paths.cl_weights_path
+        self.chroma_db_path = self.paths.chroma_db_path
         self.rag_embedding_model = "text-embedding-3-small"
 
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
         self.model = os.getenv("OPENAI_MODEL", "gpt-4.1")
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.spm_model_path = "/home/kaur-m43/spm_5M.model"
-        self.spm_vocab_path = "/home/kaur-m43/spm_5M.vocab"
+        self.spm_model_path = self.paths.spm_model_path
+        self.spm_vocab_path = self.paths.spm_vocab_path
 
         self.springer_api_key = os.getenv("SPRINGER_NATURE_API_KEY", "")
         self.semantic_scholar_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
@@ -1223,7 +1219,7 @@ class OrchestratorConfig:
             "property_prediction": True,
             "polymer_generation": True,
             "web_search": True,
-            "report_generation": True,   # <-- FIX: required by the Gradio interface
+            "report_generation": True,   # required by UI
             "mol_render": True,
             "gen_grid": True,
             "prop_attribution": True,
@@ -1268,7 +1264,7 @@ TOOL_DESCRIPTIONS = {
             "CrossRef, OpenAlex, EuropePMC, arXiv, Semantic Scholar, Springer Nature (API key), Internet Archive"
         ),
     },
-    "report_generation": {  # <-- FIX: required by the Gradio interface
+    "report_generation": {
         "name": "Report Generation",
         "description": (
             "Synthesizes available tool outputs into a single structured report object "
@@ -1299,6 +1295,10 @@ TOOL_DESCRIPTIONS = {
 class PolymerOrchestrator:
     def __init__(self, config: OrchestratorConfig):
         self.config = config
+
+        # Build registries from placeholders (no behavior change; just centralization)
+        self.PROPERTY_HEAD_PATHS, self.PROPERTY_HEAD_META, self.GENERATOR_DIRS = build_property_registries(self.config.paths)
+
         self._openai_client = None
         self._openai_unavailable_reason = None
         self._data_extractor = None
@@ -1315,6 +1315,9 @@ class PolymerOrchestrator:
 
         self.system_prompt = self._build_system_prompt()
 
+    # -------------------------------------------------------------------------
+    # OpenAI client 
+    # -------------------------------------------------------------------------
     @property
     def openai_client(self):
         if self._openai_client is None:
@@ -1336,7 +1339,7 @@ class PolymerOrchestrator:
         return (
             "You are the tool-planning module for **PolyAgent**, a polymer-science agent.\n"
             "Your job is to inspect the user's questions and decide which tools\n"
-            "to run in which order. \n\n"
+            "to run in which order.\n\n"
             "Critical tool dependencies:\n"
             "- property_prediction should run AFTER cl_encoding when possible and should reuse cl_encoding.embedding.\n"
             "- polymer_generation is inverse-design and REQUIRES target_value (property -> PSMILES).\n\n"
@@ -1345,7 +1348,7 @@ class PolymerOrchestrator:
         )
 
     # =============================================================================
-    # Planner: LLM tool-calling (no rule-based planner)
+    # Planner: LLM tool-calling
     # =============================================================================
     def analyze_query(self, user_query: str) -> Dict[str, Any]:
         schema_keys = ["analysis", "tools_required", "execution_plan"]
@@ -1394,7 +1397,6 @@ class PolymerOrchestrator:
             }
         }
 
-        # Preferred: function/tool-calling
         try:
             response = self.openai_client.chat.completions.create(
                 model=self.config.model,
@@ -1420,7 +1422,6 @@ class PolymerOrchestrator:
 
             raise RuntimeError("Tool-calling plan not returned; falling back to JSON mode.")
         except Exception:
-            # Safe fallback: JSON response_format (still LLM-generated, not rule-based)
             try:
                 response = self.openai_client.chat.completions.create(
                     model=self.config.model,
@@ -1466,7 +1467,7 @@ class PolymerOrchestrator:
                     output = self._run_polymer_generation(step, intermediate_data)
                 elif tool_name == "web_search":
                     output = self._run_web_search(step, intermediate_data)
-                elif tool_name == "report_generation":  # <-- FIX
+                elif tool_name == "report_generation":
                     output = self._run_report_generation(step, intermediate_data)
                 elif tool_name == "mol_render":
                     output = self._run_mol_render(step, intermediate_data)
@@ -1580,7 +1581,6 @@ class PolymerOrchestrator:
                 "year": meta.get("year", ""),
                 "source": meta.get("source", meta.get("source_path", "")),
                 "venue": meta.get("venue", meta.get("journal", "")),
-                # NEW: preserve citable identifiers when present in metadata
                 "url": meta.get("url") or meta.get("link") or meta.get("href") or "",
                 "doi": meta.get("doi") or "",
             })
@@ -1705,9 +1705,10 @@ class PolymerOrchestrator:
                     "attention_mask": torch.ones(1, 2048, dtype=torch.bool, device=self.config.device),
                 }
 
-        # psmiles tokenization for psmiles encoder
+        # psmiles encoder input
         if self._psmiles_tokenizer is None:
             try:
+                from PolyFusion.DeBERTav2 import build_psmiles_tokenizer
                 self._psmiles_tokenizer = build_psmiles_tokenizer()
             except Exception:
                 self._psmiles_tokenizer = None
@@ -1734,7 +1735,6 @@ class PolymerOrchestrator:
             with torch.no_grad():
                 embeddings_dict = self._cl_encoder.encode(batch_mods)
 
-            # enforce that all four modalities are present (gine, schnet, fp, psmiles)
             required_modalities = ("gine", "schnet", "fp", "psmiles")
             missing = [m for m in required_modalities if m not in embeddings_dict]
             if missing:
@@ -1757,8 +1757,8 @@ class PolymerOrchestrator:
         import torch.nn as nn
 
         property_name = canonical_property_name(property_name)
-        prop_ckpt = PROPERTY_HEAD_PATHS.get(property_name)
-        prop_meta = PROPERTY_HEAD_META.get(property_name)
+        prop_ckpt = self.PROPERTY_HEAD_PATHS.get(property_name)
+        prop_meta = self.PROPERTY_HEAD_META.get(property_name)
 
         if prop_ckpt is None:
             raise ValueError(f"No property head registered for: {property_name}")
@@ -1778,7 +1778,6 @@ class PolymerOrchestrator:
 
         ckpt = torch.load(prop_ckpt, map_location=self.config.device, weights_only=False)
 
-        # locate state dict
         state_dict = None
         for k in ("state_dict", "model_state_dict", "model_state", "head_state_dict", "regressor_state_dict"):
             if isinstance(ckpt, dict) and k in ckpt and isinstance(ckpt[k], dict):
@@ -1804,7 +1803,6 @@ class PolymerOrchestrator:
 
         head = RegressionHeadOnly(hidden_dim=600, dropout=float(meta.get("dropout", 0.1))).to(self.config.device)
 
-        # normalize key prefixes
         normalized = {}
         for k, v in state_dict.items():
             nk = k
@@ -1825,7 +1823,6 @@ class PolymerOrchestrator:
         head.load_state_dict(normalized, strict=False)
         head.eval()
 
-        # y scaler
         y_scaler = None
         if isinstance(ckpt, dict):
             for sk in ("y_scaler", "scaler_y", "target_scaler", "y_normalizer"):
@@ -1852,16 +1849,14 @@ class PolymerOrchestrator:
             return {"error": "Specify property name"}
 
         property_name = canonical_property_name(property_name)
-        if property_name not in PROPERTY_HEAD_PATHS:
+        if property_name not in self.PROPERTY_HEAD_PATHS:
             return {"error": f"Unsupported property: {property_name}"}
 
-        # Prefer embedding from cl_encoding output if available
         emb_from_cl = None
         cl = data.get("cl_encoding", None)
         if isinstance(cl, dict) and isinstance(cl.get("embedding"), list) and len(cl["embedding"]) == 600:
             emb_from_cl = torch.tensor([cl["embedding"]], dtype=torch.float32, device=self.config.device)
 
-        # If no embedding provided, compute via extraction + CL
         multimodal = data.get("data_extraction", None)
         psmiles = data.get("psmiles", data.get("smiles", None))
         if emb_from_cl is None:
@@ -1879,18 +1874,16 @@ class PolymerOrchestrator:
                 with torch.no_grad():
                     embs = self._cl_encoder.encode(batch_mods)
 
-                # enforce all four modalities
                 required_modalities = ("gine", "schnet", "fp", "psmiles")
                 missing = [m for m in required_modalities if m not in embs]
                 if missing:
                     return {"error": f"CL encoder did not return embeddings for modalities: {', '.join(missing)}"}
 
                 all_embs = [embs[k] for k in required_modalities]
-                emb_from_cl = torch.stack(all_embs, dim=0).mean(dim=0)  # (B,600)
+                emb_from_cl = torch.stack(all_embs, dim=0).mean(dim=0)
             except Exception as e:
                 return {"error": f"Failed to compute CL embedding: {e}"}
 
-        # Predict
         try:
             head, y_scaler, meta, ckpt_path = self._load_property_head(property_name)
             with torch.no_grad():
@@ -1898,27 +1891,21 @@ class PolymerOrchestrator:
 
             pred_value = float(pred_norm)
 
-            # 1) Preferred: inverse_transform using the actual scaler object if available
             if y_scaler is not None and hasattr(y_scaler, "inverse_transform"):
                 try:
                     inv = y_scaler.inverse_transform(np.array([[pred_norm]], dtype=float))
                     pred_value = float(inv[0][0])
                 except Exception:
                     pred_value = float(pred_norm)
-
-            # 2) Fallback: use metadata params if scaler object is missing
             else:
                 mean = (meta or {}).get("scaler_mean", None)
                 scale = (meta or {}).get("scaler_scale", None)
-
-                # StandardScaler inverse: x = x_scaled * scale + mean
                 try:
                     if isinstance(mean, list) and isinstance(scale, list) and len(mean) == 1 and len(scale) == 1:
                         pred_value = float(pred_norm) * float(scale[0]) + float(mean[0])
                 except Exception:
                     pred_value = float(pred_norm)
 
-            # best-effort psmiles context
             out_psmiles = None
             if isinstance(multimodal, dict):
                 out_psmiles = multimodal.get("canonical_psmiles")
@@ -1933,7 +1920,7 @@ class PolymerOrchestrator:
                 "predictions": {property_name: pred_value},
                 "prediction_normalized": float(pred_norm),
                 "head_checkpoint_path": ckpt_path,
-                "metadata_path": PROPERTY_HEAD_META.get(property_name, ""),
+                "metadata_path": self.PROPERTY_HEAD_META.get(property_name, ""),
                 "normalization_applied": bool(
                     (y_scaler is not None and hasattr(y_scaler, "inverse_transform")) or
                     ((meta or {}).get("scaler_mean") is not None and (meta or {}).get("scaler_scale") is not None)
@@ -1943,11 +1930,8 @@ class PolymerOrchestrator:
         except Exception as e:
             return {"error": f"Property prediction failed: {e}"}
 
-    # ----------------- Inverse-design generator (NEW: CL + SELFIES-TED, as in G2) ----------------- #
+    # ----------------- Inverse design generator (CL + SELFIES-TED) ----------------- #
     def _get_selfies_ted_backend(self, model_name: str) -> Tuple[Any, Any]:
-        """
-        Cache and return (tokenizer, model) for a given SELFIES-TED model name.
-        """
         if not model_name:
             model_name = SELFIES_TED_MODEL_NAME
         if model_name in self._selfies_ted_cache:
@@ -1958,18 +1942,11 @@ class PolymerOrchestrator:
         return tok, model
 
     def _load_property_generator(self, property_name: str):
-        """
-        Load PolyBART-style inverse-design artifacts produced by G2.py:
-          - decoder_best_fold*.pt : state_dict of CLConditionedSelfiesTEDGenerator
-          - standardscaler_*.joblib : StandardScaler on property values
-          - gpr_psmiles_*.joblib : LatentPropertyModel (z->property)
-          - meta.json : meta info (selfies_ted_model, cl_emb_dim, mem_len, tol_scaled, ...)
-        """
         property_name = canonical_property_name(property_name)
         if property_name in self._property_generators:
             return self._property_generators[property_name]
 
-        base_dir = GENERATOR_DIRS.get(property_name)
+        base_dir = self.GENERATOR_DIRS.get(property_name)
         if base_dir is None:
             raise ValueError(f"No generator registered for: {property_name}")
         if not os.path.isdir(base_dir):
@@ -2017,12 +1994,10 @@ class PolymerOrchestrator:
         if not gpr_path or not os.path.exists(gpr_path):
             raise FileNotFoundError(f"GPR *.joblib not found in {base_dir}")
 
-        # Latent property model and scaler (G2-style LatentPropertyModel)
         _install_unpickle_shims()
-        scaler_y = _safe_joblib_load(scaler_path)   # StandardScaler on property
-        latent_prop_model = _safe_joblib_load(gpr_path)  # should be LatentPropertyModel dataclass-like
+        scaler_y = _safe_joblib_load(scaler_path)
+        latent_prop_model = _safe_joblib_load(gpr_path)
 
-        # SELFIES-TED backbone
         selfies_ted_name = meta.get("selfies_ted_model", SELFIES_TED_MODEL_NAME)
         tok, selfies_backbone = self._get_selfies_ted_backend(selfies_ted_name)
 
@@ -2037,7 +2012,6 @@ class PolymerOrchestrator:
         ).to(self.config.device)
 
         ckpt = torch.load(decoder_path, map_location=self.config.device, weights_only=False)
-        # In G2, decoder_best_fold*.pt is a plain state_dict; keep robust fallback
         state_dict = None
         if isinstance(ckpt, dict) and all(isinstance(v, torch.Tensor) for v in ckpt.values()):
             state_dict = ckpt
@@ -2077,17 +2051,10 @@ class PolymerOrchestrator:
         latent_noise_std: float = LATENT_NOISE_STD_GEN,
         extra_factor: int = 8,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-        """
-        Simple PolyBART-style latent sampler:
-          - if seed_latents provided, sample Gaussian noise around them and L2-normalize
-          - else, sample random latents on unit hypersphere
-          - score via latent_prop_model (z->property), keep those near target.
-        """
         def _l2_normalize_np(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
             n = np.linalg.norm(x, axis=-1, keepdims=True)
             return x / np.clip(n, eps, None)
 
-        # target in scaled space
         if y_scaler is not None and hasattr(y_scaler, "transform"):
             target_s = float(y_scaler.transform(np.array([[target_value]], dtype=np.float32))[0, 0])
         else:
@@ -2127,23 +2094,14 @@ class PolymerOrchestrator:
 
     @torch.no_grad()
     def _run_polymer_generation(self, step: Dict, data: Dict) -> Dict:
-        """
-        Inverse-design generation (CL latent → pSELFIES via SELFIES-TED → PSMILES).
-
-        Corrections implemented:
-          1) ONLY return RDKit-valid generated outputs (filter invalid candidates).
-          2) Replace bracketed [At]/[AT]/[aT]/... with [*] AFTER the RDKit validity check
-             but BEFORE writing the response payload.
-        """
         property_name = data.get("property", data.get("property_name", None))
         if property_name is None:
             return {"error": "Specify property name for generation"}
 
         property_name = canonical_property_name(property_name)
-        if property_name not in GENERATOR_DIRS:
+        if property_name not in self.GENERATOR_DIRS:
             return {"error": f"Unsupported property: {property_name}"}
 
-        # STRICT: require target_value (support a few common aliases)
         if data.get("target_value", None) is not None:
             target_value = data["target_value"]
         elif data.get("target", None) is not None:
@@ -2177,14 +2135,12 @@ class PolymerOrchestrator:
 
         latent_dim = int(getattr(decoder_model, "cl_emb_dim", 600))
 
-        # choose target scaler: prefer latent_prop_model.y_scaler, fall back to scaler_y
         y_scaler = getattr(latent_prop_model, "y_scaler", None)
         if y_scaler is None:
             y_scaler = scaler_y if scaler_y is not None else None
 
         tol_scaled = float(tol_scaled_override) if tol_scaled_override is not None else float(meta.get("tol_scaled", 0.5))
 
-        # Collect seed latents from available sources:
         seed_latents: List[np.ndarray] = []
         cl_enc = data.get("cl_encoding", None)
         if isinstance(cl_enc, dict) and isinstance(cl_enc.get("embedding"), list):
@@ -2192,7 +2148,6 @@ class PolymerOrchestrator:
             if emb.shape[0] == latent_dim:
                 seed_latents.append(emb)
 
-        # Optional seed pSMILES strings for biasing
         seeds_str: List[str] = []
         if isinstance(data.get("seed_psmiles_list"), list):
             seeds_str.extend([str(x) for x in data["seed_psmiles_list"] if isinstance(x, str)])
@@ -2200,10 +2155,8 @@ class PolymerOrchestrator:
             seeds_str.append(str(data["seed_psmiles"]))
         if data.get("psmiles") and not seeds_str:
             seeds_str.append(str(data["psmiles"]))
-
         seeds_str = list(dict.fromkeys(seeds_str))
 
-        # If seed strings provided but no seed latents yet, compute CL embeddings for each seed
         if seeds_str and not seed_latents:
             self._ensure_cl_encoder()
             for s in seeds_str:
@@ -2216,7 +2169,6 @@ class PolymerOrchestrator:
                     if z.shape[0] == latent_dim:
                         seed_latents.append(z)
 
-        # Sample latents targeting the property
         try:
             Z_keep, y_s_keep, y_u_keep, target_s = self._sample_latents_for_target(
                 latent_prop_model=latent_prop_model,
@@ -2232,7 +2184,6 @@ class PolymerOrchestrator:
         except Exception as e:
             return {"error": f"Failed to sample latents conditioned on property: {e}", "paths": paths}
 
-        # --- helpers ---
         at_bracket_re = re.compile(r"\[(at)\]", flags=re.IGNORECASE)
 
         def _at_to_star_bracket(s: str) -> str:
@@ -2241,7 +2192,6 @@ class PolymerOrchestrator:
             return at_bracket_re.sub("[*]", s)
 
         def _is_rdkit_valid(psmiles: str) -> bool:
-            # If RDKit is unavailable, we cannot validate; treat as "valid" but flag it below.
             if Chem is None:
                 return True
             try:
@@ -2251,17 +2201,11 @@ class PolymerOrchestrator:
             except Exception:
                 return False
 
-        # Decode latents → pSELFIES → PSMILES; filter to RDKit-valid ONLY.
-        # Shortening strategy (3rd approach): generate MORE valid candidates, then keep the shortest valid K.
         requested_k = int(num_samples)
-
-        # candidates are tuples:
-        #   (len(psmiles), abs(y_s - target_s), psmiles_out, selfies_str, y_s, y_u)
         candidates: List[Tuple[int, float, str, str, float, float]] = []
 
-        # Reuse existing knob (extra_factor) to control "generate more" without adding new API surface.
         candidates_per_latent = max(1, int(extra_factor))
-        max_gen_rounds = 4  # best-effort retries to satisfy requested_k under RDKit validity filtering
+        max_gen_rounds = 4
 
         Z_round, y_s_round, y_u_round = Z_keep, y_s_keep, y_u_keep
         for _round in range(max_gen_rounds):
@@ -2279,9 +2223,7 @@ class PolymerOrchestrator:
                     for selfies_str in (outs or []):
                         psm_raw = pselfies_to_psmiles(selfies_str)
 
-                        # Correction #1: validate FIRST on the raw returned string
                         if _is_rdkit_valid(psm_raw):
-                            # Correction #2: convert [At] -> [*] AFTER validation, BEFORE response writing
                             psm_out = _at_to_star_bracket(psm_raw)
                             candidates.append(
                                 (
@@ -2296,11 +2238,9 @@ class PolymerOrchestrator:
                 except Exception:
                     continue
 
-            # Stop early once we have enough valid candidates to select the shortest K.
             if len(candidates) >= requested_k:
                 break
 
-            # If still short, resample latents and try again (best-effort; keeps validity constraints).
             try:
                 Z_round, y_s_round, y_u_round, target_s = self._sample_latents_for_target(
                     latent_prop_model=latent_prop_model,
@@ -2316,11 +2256,9 @@ class PolymerOrchestrator:
             except Exception:
                 break
 
-        # Keep shortest valid K (tie-break by closeness to target in scaled space)
         candidates.sort(key=lambda t: (t[0], t[1]))
         selected = candidates[:requested_k]
 
-        # Ensure we return as many as requested when possible (repeat shortest valid if needed).
         if selected and len(selected) < requested_k:
             while len(selected) < requested_k:
                 selected.append(selected[0])
@@ -2334,8 +2272,8 @@ class PolymerOrchestrator:
             "property": property_name,
             "target_value": float(target_value),
             "num_samples": int(len(generated_psmiles)),
-            "generated_psmiles": generated_psmiles,   # RDKit-valid ONLY; [At]->[*] applied after validation
-            "generated_selfies": selfies_raw,         # aligned with generated_psmiles
+            "generated_psmiles": generated_psmiles,
+            "generated_selfies": selfies_raw,
             "latent_property_predictions": {
                 "scaled": decoded_scaled,
                 "unscaled": decoded_unscaled,
@@ -2386,11 +2324,11 @@ class PolymerOrchestrator:
                 doi = normalize_doi(it.get("DOI", "")) or ""
 
                 publisher = (it.get("publisher") or "").lower()
-                # Optional: exclude Brill explicitly
                 if doi and doi.startswith("10.1163/"):
                     continue
                 if "brill" in publisher:
                     continue
+
                 pub_year = None
                 if it.get("published-print") and isinstance(it["published-print"].get("date-parts"), list):
                     pub_year = it["published-print"]["date-parts"][0][0]
@@ -2402,7 +2340,6 @@ class PolymerOrchestrator:
                     doi = ""
                     doi_url = ""
 
-                # Prefer DOI URL when valid; otherwise fall back to Crossref's URL field if present.
                 landing = (it.get("URL") or "") if isinstance(it.get("URL"), str) else ""
                 out.append({
                     "title": title,
@@ -2433,7 +2370,6 @@ class PolymerOrchestrator:
                     continue
 
                 doi = normalize_doi(it.get("doi", "")) or ""
-                # Optional: exclude Brill explicitly
                 if doi and doi.startswith("10.1163/"):
                     continue
 
@@ -2450,11 +2386,12 @@ class PolymerOrchestrator:
 
                 out.append({
                     "title": it.get("title", ""),
-                    "doi": doi,                  # normalized, not a URL
-                    "url": landing or "",         # prefer landing page URL
+                    "doi": doi,
+                    "url": landing or "",
                     "year": it.get("publication_year") or (it.get("publication_date", "")[:4]),
                     "venue": (it.get("host_venue") or {}).get("display_name", ""),
-                    "type": oa_type,                    "source": "OpenAlex",
+                    "type": oa_type,
+                    "source": "OpenAlex",
                 })
             return out
         except Exception as e:
@@ -2648,25 +2585,16 @@ class PolymerOrchestrator:
         return {"error": f"Unsupported web_search source: {src}"}
 
     # =============================================================================
-    # REPORT GENERATION (FIX for Gradio interface expectations)
+    # REPORT GENERATION
     # =============================================================================
     def generate_report(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Minimal, interface-safe report generator used by the Gradio UI fallback.
-
-        - Runs data_extraction -> cl_encoding -> property_prediction when possible
-        - Optionally runs polymer_generation if generate=True or if target_value present
-        - Optionally runs web_search if a query/literature_query is present
-        """
         payload = dict(data or {})
         summary: Dict[str, Any] = {}
 
-        # Seed psmiles/property
         prop = payload.get("property") or payload.get("property_name")
         if prop:
             payload["property"] = prop
 
-        # NEW: infer property from questions when missing
         if not payload.get("property"):
             qtxt = payload.get("questions") or payload.get("question") or ""
             inferred_prop = infer_property_from_text(qtxt)
@@ -2677,39 +2605,33 @@ class PolymerOrchestrator:
         if psmiles:
             payload["psmiles"] = psmiles
 
-        # NEW: infer target_value from questions when missing (only useful for generation)
         if payload.get("target_value", None) is None:
             qtxt = payload.get("questions") or payload.get("question") or ""
             inferred_tgt = infer_target_value_from_text(qtxt, payload.get("property"))
             if inferred_tgt is not None:
                 payload["target_value"] = float(inferred_tgt)
 
-        # 1) data_extraction
         if psmiles and "data_extraction" not in payload:
             ex = self._run_data_extraction({"step": -1}, payload)
             payload["data_extraction"] = ex
             summary["data_extraction"] = ex
 
-        # 2) cl_encoding
         if "data_extraction" in payload and "cl_encoding" not in payload:
             cl = self._run_cl_encoding({"step": -1}, payload)
             payload["cl_encoding"] = cl
             summary["cl_encoding"] = cl
 
-        # 3) property_prediction
         if payload.get("property") and "property_prediction" not in payload:
             pp = self._run_property_prediction({"step": -1}, payload)
             payload["property_prediction"] = pp
             summary["property_prediction"] = pp
 
-        # 4) polymer_generation (optional)
         do_gen = bool(payload.get("generate", False)) or (payload.get("target_value", None) is not None)
         if do_gen and payload.get("property") and payload.get("target_value", None) is not None:
             gen = self._run_polymer_generation({"step": -1}, payload)
             payload["polymer_generation"] = gen
             summary["generation"] = gen
 
-        # 5) web_search (optional)
         q = payload.get("query") or payload.get("literature_query")
         src = payload.get("source") or "all"
         if q:
@@ -2730,7 +2652,6 @@ class PolymerOrchestrator:
             "questions": payload.get("questions") or payload.get("question") or "",
         }
 
-        # Add domain tags + (domain.com) cite tags, and tool tags [T#]
         report = _attach_source_domains(report)
         report = _index_citable_sources(report)
         report = _assign_tool_tags_to_report(report)
@@ -2740,32 +2661,23 @@ class PolymerOrchestrator:
     def _run_report_generation(self, step: Dict, data: Dict) -> Dict[str, Any]:
         return self.generate_report(data)
 
+    # =============================================================================
+                                        # COMPOSER
+    # =============================================================================
     def compose_gpt_style_answer(
         self,
         report: Dict[str, Any],
         case_brief: str = "",
         questions: str = "",
     ) -> Tuple[str, List[str]]:
-        """
-        Interface-safe composer. Uses OpenAI if available; otherwise returns a deterministic markdown.
-        Must return: (final_markdown, list_of_image_paths).
-
-        Updated requirements:
-          - No fixed answer template: structure must follow the user's actual questions.
-          - Literature/web citations must be domain-style like "nature.com" (never [1], [2], ...). No parentheses.
-          - Tool-derived facts must cite as [T] only.
-          - Tool outputs should be available verbatim without tweaking (appended as JSON blocks).
-        """
         imgs: List[str] = []
 
-        # Ensure tags exist even if caller didn't run generate_report()
         if isinstance(report, dict):
             report = _attach_source_domains(report)
             report = _index_citable_sources(report)
             report = _assign_tool_tags_to_report(report)
 
         if self.openai_client is None:
-            # Deterministic fallback (no API dependency)
             md_lines = []
             if case_brief:
                 md_lines.append(case_brief.strip())
@@ -2780,7 +2692,6 @@ class PolymerOrchestrator:
                 md_lines.append(str(report))
             md_lines.append("```")
 
-            # Verbatim tool outputs (no tweaking)
             verb = _render_tool_outputs_verbatim_md(report) if isinstance(report, dict) else ""
             if verb:
                 md_lines.append("\n---\n\n## Tool outputs (verbatim)\n")
@@ -2788,7 +2699,6 @@ class PolymerOrchestrator:
 
             return "\n".join(md_lines), imgs
 
-        # OpenAI-based synthesis
         try:
             prompt = (
                 "You are PolyAgent - consider yourself as an expert in polymer science. Answer the user's questions using ONLY the provided report.\n"
@@ -2804,12 +2714,11 @@ class PolymerOrchestrator:
                 "- NON-DUPLICATES: Do not repeat the same paper link. Each DOI/URL may appear at most once in the entire answer.\n"
                 "- Each major section should include at least 1 inline literature citation when relevant.\n"
                 "- Do NOT invent DOIs, URLs, titles, or sources.\n\n"
-                "- CITATIONS AS SPECIFIED ONLY: very strictly place each citation immediately after the claim it supports; do not add a references list.\n"
                 "OUTPUT RULES (STRICT):\n"
                 "- If a numeric value is not present in the report, write 'not available'.\n"
                 "- Preserve polymer endpoint tokens exactly as '[*]' in any pSMILES/SMILES shown.\n"
                 "- To prevent markdown mangling, put any pSMILES/SMILES inside code formatting.\n"
-                "- Do not rewrite or tweak any tool outputs; if you refer to them, reference them by tag (e.g., [T2]).\n\n"
+                "- Do not rewrite or tweak any tool outputs; if you refer to them, reference them by tag (e.g., [T]).\n\n"
                 f"CASE BRIEF:\n{case_brief}\n\n"
                 f"QUESTIONS:\n{questions}\n\n"
                 f"REPORT (JSON):\n{json.dumps(report, ensure_ascii=False)}\n"
@@ -2825,16 +2734,12 @@ class PolymerOrchestrator:
             )
             txt = resp.choices[0].message.content or ""
 
-            # Enforce distributed inline clickable paper citations (do not touch tool citations).
-            # This corrects cases where the model under-cites or clusters citations.
             try:
                 min_cites = _infer_required_citation_count(questions or "", default_n=10)
                 txt = _ensure_distributed_inline_citations(txt, report, min_needed=min_cites)
             except Exception:
                 pass
 
-
-            # Enforce: DOI-URL bracket text + dedupe (each DOI/URL appears at most once)
             try:
                 txt = _normalize_and_dedupe_literature_links(txt, report)
             except Exception:
@@ -2845,23 +2750,20 @@ class PolymerOrchestrator:
             except Exception:
                 pass
 
-            # Always append verbatim tool outputs (no tweaking)
             verb = _render_tool_outputs_verbatim_md(report) if isinstance(report, dict) else ""
             if verb:
                 txt = txt.rstrip() + "\n\n---\n\n## Tool outputs (verbatim)\n\n" + verb
 
             return txt, imgs
         except Exception as e:
-            # Last-resort fallback
             md = f"OpenAI compose failed: {e}\n\n```json\n{json.dumps(report, indent=2, ensure_ascii=False)}\n```"
-            # Still append verbatim tool outputs
             verb = _render_tool_outputs_verbatim_md(report) if isinstance(report, dict) else ""
             if verb:
                 md = md.rstrip() + "\n\n---\n\n## Tool outputs (verbatim)\n\n" + verb
             return md, imgs
 
     # =============================================================================
-    # VISUAL TOOLS (PNG-only)
+    # VISUAL TOOLS
     # =============================================================================
     def _run_mol_render(self, step: Dict, data: Dict) -> Dict[str, Any]:
         out_dir = Path("viz")
@@ -2915,16 +2817,6 @@ class PolymerOrchestrator:
         return {"png_path": png, "n": len(mols)}
 
     def _run_prop_attribution(self, step: Dict, data: Dict) -> Dict[str, Any]:
-        """
-        FIXED explainability:
-          - Leave-one-atom-out occlusion attribution:
-              score_i = baseline_pred - pred(mask atom i -> wildcard)
-          - Highlight ONLY meaningful atoms:
-              * Rank by |score|
-              * Apply relative threshold vs max |score| (default 0.25)
-              * Cap by top-K
-              * Ensure at least 1 atom highlighted
-        """
         out_dir = Path("viz")
         out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2935,11 +2827,10 @@ class PolymerOrchestrator:
         prop = canonical_property_name(data.get("property") or data.get("property_name") or "glass transition")
         top_k = int(data.get("top_k_atoms", data.get("top_k", 12)))
 
-        # importance threshold controls
         min_rel_importance = float(data.get("min_rel_importance", 0.25))
         min_abs_importance = float(data.get("min_abs_importance", 0.0))
 
-        if prop not in PROPERTY_HEAD_PATHS:
+        if prop not in self.PROPERTY_HEAD_PATHS:
             return {"error": f"Unsupported property for attribution: {prop}"}
         if not p:
             return {"error": "no psmiles"}
@@ -2960,7 +2851,6 @@ class PolymerOrchestrator:
         if not isinstance(baseline, (float, int)):
             return {"error": "Baseline prediction not numeric"}
 
-        # Occlusion loop (O(N_atoms) property predictions)
         scores: Dict[int, float] = {}
         for idx in range(num_atoms):
             try:
@@ -2968,7 +2858,7 @@ class PolymerOrchestrator:
                 tmp.GetAtomWithIdx(idx).SetAtomicNum(0)  # wildcard
                 mutated = tmp.GetMol()
                 mut_smiles = Chem.MolToSmiles(mutated)
-                mut_psmiles = normalize_generated_psmiles_out(mut_smiles)  # [*] -> *
+                mut_psmiles = normalize_generated_psmiles_out(mut_smiles)
             except Exception:
                 scores[idx] = 0.0
                 continue
@@ -2980,7 +2870,6 @@ class PolymerOrchestrator:
             else:
                 scores[idx] = float(baseline) - float(mut_val)
 
-        # Select atoms: top-K by |score| but also require significance
         max_abs = max((abs(v) for v in scores.values()), default=0.0)
         rel_thresh = (min_rel_importance * max_abs) if max_abs > 0 else 0.0
         thresh = max(float(min_abs_importance), float(rel_thresh))
@@ -2991,11 +2880,9 @@ class PolymerOrchestrator:
         selected = [i for i, v in ranked if abs(v) >= thresh]
         selected = selected[:k_cap]
 
-        # Ensure at least one highlighted atom
         if not selected and ranked:
             selected = [ranked[0][0]]
 
-        # Map colors (coolwarm) over selected only
         atom_colors: Dict[int, tuple] = {}
         sel_scores = np.array([scores[i] for i in selected], dtype=float)
         if cm is not None and sel_scores.size > 0:
@@ -3043,7 +2930,6 @@ class PolymerOrchestrator:
         except Exception as e:
             return {"error": f"prop_attribution rendering failed: {e}"}
 
-    # convenience
     def process_query(self, user_query: str, user_inputs: Dict[str, Any] = None) -> Dict[str, Any]:
         plan = self.analyze_query(user_query)
         results = self.execute_plan(plan, user_inputs)
@@ -3051,6 +2937,6 @@ class PolymerOrchestrator:
 
 
 if __name__ == "__main__":
-    cfg = OrchestratorConfig()
+    cfg = OrchestratorConfig(paths=PathsConfig())
     orch = PolymerOrchestrator(cfg)
-    print("PolymerOrchestrator ready (5M heads + 5M inverse-design + LLM tool-calling planner + occlusion explainability).")
+    print("PolymerOrchestrator ready (5M heads + 5M inverse-design + LLM planner + occlusion explainability).")
