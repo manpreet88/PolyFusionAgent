@@ -21,7 +21,7 @@ try:
     from orchestrator import PolymerOrchestrator, OrchestratorConfig
 except Exception as e:
     raise ImportError(
-        "Could not import PolymerOrchestrator from orchestrator_updated.py. "
+        "Could not import PolymerOrchestrator from orchestrator.py. "
         "Ensure the updated orchestrator file is present. "
         f"Original error: {e}"
     )
@@ -108,7 +108,7 @@ RUN_INSTRUCTIONS_MD = (
     "\n"
     "**4) Start the interface**\n"
     "- Run:\n"
-    "  - `python gradio_interface_for_polymer_orchestrator.py --server-name 0.0.0.0 --server-port 7860`\n"
+    "  - `python gradio_interface.py --server-name 0.0.0.0 --server-port 7860`\n"
     "\n"
     "**5) How to prompt in the Console**\n"
     "- To trigger inverse design: include a generation intent (e.g., “generate”, “inverse design”) and a target value.\n"
