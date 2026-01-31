@@ -8,6 +8,8 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit.Chem import rdFingerprintGenerator
 import networkx as nx
 import requests
+from pathlib import Path
+import argparse
 import time
 import json
 from typing import List, Dict, Tuple, Optional
