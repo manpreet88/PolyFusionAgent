@@ -57,36 +57,49 @@ PolyAgent closes the design loop by coupling prediction and inverse design to ev
 
 ## 1. Repository Overview
 
-This repository contains three major components:
-
-### **(A) PolyFusion** — multimodal polymer foundation model
-PolyFusion learns a shared embedding space by aligning polymer modalities with **multimodal contrastive learning**:
-- **PSMILES encoder**: DeBERTaV2-style sequence encoder (`PolyFusion/DeBERTav2.py`)
-- **2D graph encoder**: GINE (Graph Isomorphism Network w/ edge features) (`PolyFusion/GINE.py`)
-- **3D proxy encoder**: SchNet (`PolyFusion/SchNet.py`)
-- **Fingerprint encoder**: Transformer encoder for Morgan bits (`PolyFusion/Transformer.py`)
-- **Pretraining script**: `PolyFusion/CL.py`
-
-### **(B) Downstream Tasks** — prediction + inverse design
-- **Property prediction** (multi-property evaluation with per-property CV): `Downstream Tasks/Property_Prediction.py`
-- **Inverse design / generation** (property-conditioned generation using SELFIES-TED decoding + latent guidance): `Downstream Tasks/Polymer_Generation.py`
-
-### **(C) PolyAgent** — tool-augmented design assistant
-A modular orchestrator that can:
-- extract multimodal polymer data
-- encode PolyFusion embeddings
-- predict properties using best downstream heads
-- generate candidates via an inverse-design generator
-- retrieve literature via local RAG + web
-- visualize polymer renderings and explainability maps
-- compose a grounded, citation-linked final response
-
-Files:
-- `PolyAgent/orchestrator.py`
-- `PolyAgent/rag_pipeline.py`
-- `PolyAgent/gradio_interface.py`
-
+PolyFusionAgent has three tightly coupled layers:  
+**(i) PolyFusion** learns a transferable multimodal embedding space; **(ii) task heads** perform property prediction and property-conditioned generation using that embedding; and **(iii) PolyAgent** orchestrates tools (prediction, generation, retrieval, visualization) to produce grounded, audit-ready design outputs.
 ---
+
+### A. PolyFusion — multimodal polymer foundation model (FM) 
+**Modalities + encoders:** 
+- **PSMILES (D)** → DeBERTaV2-style encoder (`PolyFusion/DeBERTav2.py`)  
+- **2D molecular graph (G)** → **GINE** (Graph Isomorphism Network with Edge features) (`PolyFusion/GINE.py`)  
+- **3D geometry proxy (S)** → **SchNet** (continuous-filter network for 3D structures) (`PolyFusion/SchNet.py`) 
+- **Fingerprints (T)** → Transformer encoder (`PolyFusion/Transformer.py`)
+
+**Pretraining objective:**  
+PolyFusion forms a **fused structural anchor** from (D, G, S) and contrastively aligns it to the **fingerprint target** (T) using an **InfoNCE** loss over a cross-similarity matrix. (`PolyFusion/CL.py`) 
+
+Key entrypoint:
+- `PolyFusion/CL.py` — multimodal contrastive pretraining (anchor–target InfoNCE)
+---
+
+### B. Downstream tasks — prediction + inverse design
+These scripts adapt PolyFusion embeddings for two core tasks:
+
+- **Property prediction (structure → properties)**  
+  `Downstream Tasks/Property_Prediction.py`  
+  Trains lightweight regression heads on top of (typically frozen) PolyFusion embeddings for thermophysical properties (e.g., ρ, Tg, Tm, Td). 
+
+- **Inverse design / generation (target properties → candidate polymers)**  
+  `Downstream Tasks/Polymer_Generation.py`  
+  Performs property-conditioned generation using PolyFusion embeddings as the conditioning interface with a pretrained SELFIES-based encoder–decoder (SELFIES-TED) and latent guidance.
+---
+
+### C. PolyAgent — tool-augmented AI assistant (controller + tools)
+
+**Goal:** convert open-ended polymer design prompts into **grounded, constraint-consistent, evidence-linked** outputs by coupling PolyFusion with tool-mediated verification and retrieval.
+
+**What PolyAgent does (system-level):**  
+- decomposes a user request into typed sub-tasks  
+- calls tools for **prediction**, **generation**, **retrieval (local RAG + web)**, and **visualization**  
+- returns a final response with explicit evidence/citations and an experiment-ready validation plan
+
+Main files:
+- `PolyAgent/orchestrator.py` — planning + tool routing (controller)
+- `PolyAgent/rag_pipeline.py` — local retrieval utilities (PDF → chunks → embeddings → vector store)
+- `PolyAgent/gradio_interface.py` — Gradio UI entrypoint
 
 ## 2. Dependencies & Environment
 
