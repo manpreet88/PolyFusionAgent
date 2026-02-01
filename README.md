@@ -109,16 +109,52 @@ Main files:
 git clone https://github.com/manpreet88/PolyFusionAgent.git
 cd PolyFusionAgent
 
-# Recommended: create a fresh environment (conda or venv), then:
+# Recommended: create a clean environment (conda or venv), then:
 pip install -r requirements.txt
-2.2 Optional Chemistry & GPU Notes
-RDKit (recommended)
-Data_Modalities.py and many optional visual/validation steps in generation/agent workflows work best with RDKit.
-Recommended installation:
 
+Recommended Python: 3.9–3.11 (keep your Python/PyTorch/CUDA versions consistent across machines for reproducibility).
+
+2.2 Optional chemistry stack (recommended)
+
+Many core pipelines (multimodal data acquisition - 2D garph, 3D proxy, & fingerprint construction, canonicalization, validity checks, and visualization) rely on RDKit, and to render polymer depictions in the PolyAgent visualizer.
+
+```bash
 conda install -c conda-forge rdkit
-GPU (recommended for training & large runs)
-PyTorch + CUDA should match your GPU driver. If you use torch-geometric, install it following the official wheels for your CUDA/PyTorch build.
+ 
+2.3 GPU acceleration (recommended for training and large runs)
+
+Training PolyFusion and running large-scale downstream experiments is significantly faster on GPU.
+
+PyTorch + CUDA
+
+Install a CUDA-enabled PyTorch build that matches your NVIDIA driver / CUDA runtime.
+
+Verify GPU visibility:
+nvidia-smi
+python -c "import torch; print('cuda:', torch.cuda.is_available(), '| torch:', torch.__version__, '| cuda_ver:', torch.version.cuda)"
+
+torch-geometric (if enabled/required in your setup)
+If you require to use torch-geometric for GINE, install wheels that match your exact PyTorch + CUDA versions (follow the official PyG install instructions).
+
+2.4 PolyAgent runtime (UI + retrieval)
+
+PolyAgent typically adds dependencies for:
+
+UI: gradio
+
+retrieval / vector DB: faiss (or another vector store, depending on your configuration)
+
+NLP utilities: transformers (reranking/models), tokenization helpers, etc.
+You will generally need:
+
+export OPENAI_API_KEY="YOUR_KEY"
+
+
+Optional environment variables (if supported in your config):
+
+OPENAI_MODEL (controller/composition model)
+
+HF_TOKEN (to pull HF-hosted artifacts)
 
 3. Data, Modalities, and Preprocessing
 3.1 Input CSV schema
@@ -130,7 +166,7 @@ Optional:
 
 source (optional): any identifier/source tag
 
-property columns (optional): e.g., density, Tg, Tm, Td, etc. (names vary—see downstream scripts’ column matching)
+property columns (optional): e.g., ρ, Tg, Tm, Td, etc. 
 
 Example:
 
