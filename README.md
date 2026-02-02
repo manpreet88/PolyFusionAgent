@@ -149,14 +149,6 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-**Tip (recommended):** split installs by “extras” so users don’t pull GPU/RAG dependencies unless needed.
-
-- `requirements.txt` → core + inference
-- `requirements-train.txt` → training + distributed / acceleration
-- `requirements-agent.txt` → gradio + retrieval + PDF tooling
-
-(If you keep a single requirements file, clearly label optional dependencies as such.)
-
 ### 2.3 Core ML stack (PolyFusion / downstream)
 
 **Required:**
