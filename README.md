@@ -128,7 +128,6 @@ PolyFusionAgent spans three compute modes:
 
 ### 2.1 Supported platforms
 
-- **OS:** Linux recommended (Ubuntu 20.04/22.04 tested most commonly in similar stacks). macOS/Windows are supported for lightweight inference but may require extra care for RDKit/FAISS.
 - **Python:** 3.9–3.11 recommended (keep Python/PyTorch/CUDA consistent for reproducibility).
 - **GPU:** NVIDIA recommended for training. Manuscript pretraining used mixed precision and ran on NVIDIA A100 GPUs.
 
