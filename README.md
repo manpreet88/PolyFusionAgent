@@ -1,4 +1,4 @@
-# PolyFusionAgent: A Multimodal Foundation Model and an Autonomous AI Assistant for Polymer Informatics
+# PolyFusionAgent: a multimodal foundation model and autonomous AI assistant for polymer property prediction and inverse design
 
 **PolyFusionAgent** is an interactive framework that couples a **multimodal polymer foundation model (PolyFusion)** with a **tool-augmented, literature-grounded design agent (PolyAgent)** for polymer property prediction, inverse design, and evidence-linked scientific reasoning.
 
