@@ -36,21 +36,26 @@ PolyAgent closes the design loop by coupling prediction and inverse design to ev
 ## Contents
 
 - [1. Repository Overview](#1-repository-overview)
+  - [A. PolyFusion — multimodal polymer foundation model (FM)](#a-polyfusion--multimodal-polymer-foundation-model-fm)
+  - [B. Downstream tasks — prediction + inverse design](#b-downstream-tasks--prediction--inverse-design)
+  - [C. PolyAgent — tool-augmented AI assistant (controller + tools)](#c-polyagent--tool-augmented-ai-assistant-controller--tools)
 - [2. Dependencies & Environment](#2-dependencies--environment)
-  - [2.1 Installation](#21-installation)
-  - [2.2 Optional Chemistry & GPU Notes](#22-optional-chemistry--gpu-notes)
+  - [2.1 Supported platforms](#21-supported-platforms)
+  - [2.2 Installation (base)](#22-installation-base)
+  - [2.3 Core ML stack (Pretraining / Downstream)](#23-core-ml-stack-pretraining--downstream)
+  - [2.4 Chemistry stack (Strongly Recommended)](#24-chemistry-stack-strongly-recommended)
+  - [2.5 Retrieval Stack (PolyAgent)](#25-retrieval-stack-polyagent)
+  - [2.6 Environment variables](#26-environment-variables)
 - [3. Data, Modalities, and Preprocessing](#3-data-modalities-and-preprocessing)
-  - [3.1 Input CSV schema](#31-input-csv-schema)
-  - [3.2 Generate multimodal columns (graph/geometry/fingerprints)](#32-generate-multimodal-columns-graphgeometryfingerprints)
-  - [3.3 What “graph”, “geometry”, and “fingerprints” look like](#33-what-graph-geometry-and-fingerprints-look-like)
+  - [3.1 Datasets](#31-datasets)
+  - [3.2 Minimum CSV schema](#32-minimum-csv-schema)
+  - [3.3 Modalities produced per polymer](#33-modalities-produced-per-polymer)
+  - [3.4 Preprocessing script](#34-preprocessing-script)
 - [4. Models & Artifacts](#4-models--artifacts)
-- [5. Running the Code](#5-running-the-code)
-  - [5.1 Multimodal contrastive pretraining (PolyFusion)](#51-multimodal-contrastive-pretraining-polyfusion)
-  - [5.2 Downstream property prediction](#52-downstream-property-prediction)
-  - [5.3 Inverse design / polymer generation](#53-inverse-design--polymer-generation)
-  - [5.4 PolyAgent (Gradio UI)](#54-polyagent-gradio-ui)
-- [6. Results & Reproducibility](#6-results--reproducibility)
-- [7. Citation](#7-citation)
+  - [4.1 PolyFusion Checkpoints (pretraining)](#41-polyfusion-checkpoints-pretraining)
+  - [4.2 Downstream Predictors (property regression)](#42-downstream-predictors-property-regression)
+  - [4.3 Inverse Design Generator (SELFIES-TED conditioning)](#43-inverse-design-generator-selfies-ted-conditioning)
+  - [4.4 PolyAgent (Gradio UI)](#44-polyagent-gradio-ui)
 
 ---
 
@@ -101,22 +106,6 @@ These scripts adapt PolyFusion embeddings for two core tasks:
 - `PolyAgent/rag_pipeline.py` — local retrieval utilities (PDF → chunks → embeddings → vector store)
 - `PolyAgent/gradio_interface.py` — Gradio UI entrypoint
 
-### D. Datasets
-
-This repo is designed to work with large-scale pretraining corpora (for PolyFusion) plus experiment-backed downstream sets (for finetuning/evaluation). It does not redistribute these datasets—please download them from the original sources and follow their licenses/terms.
-
-**Pretraining corpora (examples used in the paper):**
-- **PI1M:** “PI1M: A Benchmark Database for Polymer Informatics.”  
-  DOI page: https://pubs.acs.org/doi/10.1021/acs.jcim.0c00726  
-  (Often mirrored/linked via PubMed)
-- **polyOne:** “polyOne Data Set – 100 million hypothetical polymers …” (Zenodo record).  
-  Zenodo: https://zenodo.org/records/7766806
-
-**Downstream / evaluation data (example):**
-- **PoLyInfo (NIMS Polymer Database)** provides experimental/literature polymer properties and metadata.  
-  Main site: https://polymer.nims.go.jp/en/  
-  Overview/help: https://polymer.nims.go.jp/PoLyInfo/guide/en/what_is_polyinfo.html
-
 ---
 
 ## 2. Dependencies & Environment
@@ -149,7 +138,7 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-### 2.3 Core ML stack (PolyFusion / downstream)
+### 2.3 Core ML stack (Pretraining / Downstream)
 
 **Required:**
 - torch (GPU build strongly recommended for training)
@@ -157,17 +146,17 @@ pip install -r requirements.txt
 - transformers (PSMILES encoder + assorted NLP utilities)
 
 **Recommended:**
-- accelerate (multi-GPU / fp16 ergonomics)
-- sentencepiece (PSMILES tokenization uses SentencePiece with a fixed 265-token vocab)
+- accelerate (fp16 ergonomics)
+- sentencepiece (PSMILES tokenization uses SentencePiece with a 265-token vocab)
 - tqdm, rich (logging)
 
-**GPU check:**
+**GPU Check:**
 ```bash
 nvidia-smi
 python -c "import torch; print('cuda:', torch.cuda.is_available(), '| torch:', torch.__version__, '| cuda_ver:', torch.version.cuda)"
 ```
 
-### 2.4 Chemistry stack (strongly recommended)
+### 2.4 Chemistry stack (Strongly Recommended)
 
 A large fraction of the pipeline depends on RDKit:
 - building graphs / fingerprints
@@ -175,25 +164,28 @@ A large fraction of the pipeline depends on RDKit:
 - canonicalization + validity checks
 - PolyAgent visualization
 
-**Install RDKit via conda-forge:**
+**RDKit Installation**
 ```bash
+# Conda (recommended)
 conda install -c conda-forge rdkit -y
+
+# OR: pip (use a fresh venv; best effort)
+python -m pip install -U pip
+python -m pip install rdkit
+
+# If rdkit isn't available/works poorly on your platform via pip:
+# use the community wheels instead (common fallback):
+python -m pip install rdkit-pypi
 ```
 
-**Wildcard endpoint handling (important):**  
+**Wildcard endpoint (*) handling:**  
 For RDKit-derived modalities, the pipeline converts polymer repeat units into a pseudo-molecule by replacing the repeat-unit wildcard attachment token `[*]` with `[At]` (Astatine) to ensure chemical sanitization and tool compatibility.
 
-### 2.5 Graph / 3D stacks (optional, depending on your implementation)
-
-If your GINE implementation uses PyTorch Geometric, install the wheels that match your exact PyTorch + CUDA combination. PyG install instructions differ by CUDA version; pin your environment carefully.
-
-If you use SchNet via a third-party implementation, confirm the dependency (e.g., schnetpack, torchmd-net, or a local SchNet module). In the manuscript, SchNet uses a neighbor list with radial cutoff 10 Å and ≤64 neighbors/atom, with 6 interaction layers and hidden size 600.
-
-### 2.6 Retrieval stack (PolyAgent)
+### 2.5 Retrieval Stack (PolyAgent)
 
 PolyAgent combines:
 - Local RAG over PDFs (chunking + embeddings + vector index)
-- Web augmentation (optional)
+- Web augmentation 
 - Reranking (cross-encoder)
 
 In the manuscript implementation, the local knowledge base is constructed from 1108 PDFs, chunked at 512/256/128 tokens with overlaps 64/48/32, embedded with OpenAI text-embedding-3-small (1536-d), and indexed using FAISS HNSW (M=64, efconstruction=200). Retrieved chunks are reranked with ms-marco-MiniLM-L-12-v2.
@@ -203,73 +195,73 @@ In the manuscript implementation, the local knowledge base is constructed from 1
 - faiss-cpu (or faiss-gpu if desired)
 - pypdf / pdfminer.six (PDF text extraction)
 - tiktoken (chunking tokens; manuscript references TikToken cl100k)
-- trafilatura (web page extraction; used in manuscript web augmentation)
+- trafilatura (web page extraction)
 - transformers (reranker and query rewrite model; manuscript uses T5 for rewriting in web augmentation)
 
-### 2.7 Environment variables
+### 2.6 Environment variables
 
 PolyAgent is a tool-orchestrated system. At minimum, set:
 ```bash
 export OPENAI_API_KEY="YOUR_KEY"
 ```
 
-Optional (if your configs support them):
+Additionally:
 ```bash
 export OPENAI_MODEL="gpt-4.1"     # controller model (manuscript uses GPT-4.1)
-export HF_TOKEN="YOUR_HF_TOKEN"   # to pull hosted weights/tokenizers if applicable
-```
-
-**Recommended .env pattern:** Create a `.env` (do not commit) and load it in the Gradio entrypoint:
-```
-OPENAI_API_KEY=...
-OPENAI_MODEL=gpt-4.1
+export HF_TOKEN="YOUR_HF_TOKEN"   # Baseline LLMs
 ```
 
 ---
 
 ## 3. Data, Modalities, and Preprocessing
 
-### 3.1 Datasets (what the manuscript uses)
+### 3.1 Datasets
+This repo is designed to work with large-scale pretraining corpora (for PolyFusion at two scales: 2M and 5M) plus experiment-backed downstream sets (for finetuning/evaluation). It does not redistribute these datasets—please download them from the original sources and follow their licenses/terms.
 
-- Pretraining uses PI1M + polyOne, at two scales: 2M and 5M polymers.
-- Downstream fine-tuning / evaluation uses PolyInfo (≈ 1.8×10⁴ experimental polymers).
-- PolyInfo is held out from pretraining.
+**Pretraining corpora (examples used in the paper):**
+- **PI1M:** “PI1M: A Benchmark Database for Polymer Informatics.”  
+  DOI page: https://pubs.acs.org/doi/10.1021/acs.jcim.0c00726  
+  (Often mirrored/linked via PubMed)
+- **polyOne:** “polyOne Data Set – 100 million hypothetical polymers …” (Zenodo record).  
+  Zenodo: https://zenodo.org/records/7766806
 
-**Where are the links?** The uploaded manuscript describes these datasets but does not include canonical URLs in the excerpted sections available here. Add the official dataset links in this README once you finalize where you host or reference them.
+**Downstream / evaluation data (example):**
+- **PoLyInfo (NIMS Polymer Database)** provides experimental/literature polymer properties and metadata.  
+  Main site: https://polymer.nims.go.jp/en/  
+  Overview/help: https://polymer.nims.go.jp/PoLyInfo/guide/en/what_is_polyinfo.html
 
 ### 3.2 Minimum CSV schema
 
-Your raw CSV must include:
+The raw CSV for pretraining must include:
 - `psmiles` (required) — polymer repeat unit string with `[*]` endpoints
 
-Optional:
-- `source` — dataset tag (PI1M/polyOne/PolyInfo/custom)
-- property columns — e.g., density, Tg, Tm, Td (names can be mapped)
+Additionally, for fine-tuning:
+- property columns — e.g., ρ, Tg, Tm, Td 
 
 **Example:**
 ```csv
-psmiles,source,density,Tg,Tm,Td
-[*]CC(=O)OCCO[*],PolyInfo,1.21,55,155,350
+psmiles,ρ,Tg,Tm,Td
+[*]CC(=O)OCCO[*],1.21,55,155,350
 ```
 
-**Endpoint note:** When generating RDKit-dependent modalities, the code may internally replace `[*]` with `[At]` to sanitize repeat-unit molecules.
+**Endpoint Note:** When generating RDKit-dependent modalities, the code may internally replace `[*]` with `[At]` to sanitize repeat-unit molecules.
 
 ### 3.3 Modalities produced per polymer
 
 PolyFusion represents each polymer using four complementary modalities:
 
 - **PSMILES sequences (D)**  
-  SentencePiece tokenization with fixed vocab size 265 (kept fixed during downstream).
+  SentencePiece tokenization with vocab size 265 (kept fixed during downstream).
 - **2D molecular graph (G)**  
   Nodes = atoms, edges = bonds, with chemically meaningful node/edge features.
 - **3D conformational proxy (S)**  
-  Conformer embedding + optimization pipeline (ETKDG/UFF described in Methods); SchNet neighbor cutoff and layer specs given in Supplementary.
+  Conformer embedding + optimization pipeline (ETKDG/UFF).
 - **Fingerprints (T)**  
   ECFP6 (radius r=3) with 2048 bits.
 
 ### 3.4 Preprocessing script
 
-Use your preprocessing utility (e.g., `Data_Modalities.py`) to append multimodal columns:
+Use the preprocessing utility (Data_Modalities.py) to append multimodal columns to both the pretraining and fine-tuning CSV files:
 
 ```bash
 python Data_Modalities.py \
@@ -278,17 +270,13 @@ python Data_Modalities.py \
   --num_workers 24
 ```
 
-**Expected outputs:**
-- `*_processed.csv` with new columns: `graph`, `geometry`, `fingerprints` (as JSON blobs)
-- `*_failures.jsonl` for failed rows (index + error)
-
 ---
 
 ## 4. Models & Artifacts
 
 This repository typically produces three artifact families:
 
-### 4.1 PolyFusion checkpoints (pretraining)
+### 4.1 PolyFusion Checkpoints (pretraining)
 
 PolyFusion maps each modality into a shared embedding space of dimension **d = 600**. Pretraining uses:
 - unified masking with **pmask = 0.15** and an **80/10/10** corruption rule
@@ -299,7 +287,12 @@ PolyFusion maps each modality into a shared embedding space of dimension **d = 6
 - projection heads
 - training config + tokenizer artifacts (SentencePiece model)
 
-### 4.2 Downstream predictors (property regression)
+**Run:**
+```bash
+python PolyFusion/CL.py
+```
+
+### 4.2 Downstream Predictors (property regression)
 
 Downstream uses:
 - fused 600-d embedding
@@ -312,70 +305,30 @@ Downstream uses:
 - best weights per property per fold
 - scalers used for standardization
 
-### 4.3 Inverse design generator (SELFIES-TED conditioning)
-
-Inverse design conditions a SELFIES-based encoder–decoder (SELFIES-TED) on PolyFusion’s 600-d embedding. Implementation details from the manuscript include:
-- conditioning via **K = 4** learned memory tokens
-- training-time latent noise **σ_train = 0.10**
-- decoding uses top-p (0.92), temperature 1.0, repetition penalty 1.05, max length 256
-- property targeting via generate-then-filter using a GP oracle and acceptance threshold **τ_s = 0.5** (standardized units)
-
-**Save:**
-- decoder weights + conditioning projection
-- tokenization assets (if applicable)
-- property oracle artifacts (GP models / scalers)
-
----
-
-## 5. Running the Code
-
-Several scripts may contain path placeholders. Centralize them into one config file (recommended) or update the constants in each entrypoint.
-
-### 5.1 Multimodal contrastive pretraining (PolyFusion)
-
-**Entrypoint:**
-- `PolyFusion/CL.py`
-
-**Manuscript-grounded defaults:**
-- AdamW, lr=1e-4, weight_decay=1e-2, batch=16, grad accum=4 (effective 64), up to 25 epochs, early stopping patience 10, FP16
-
-**Run:**
-```bash
-python PolyFusion/CL.py
-```
-
-**Sanity tip:** Start with a smaller subset (e.g., 50k–200k rows) to validate preprocessing + training stability before scaling to millions.
-
-### 5.2 Downstream property prediction
-
-**Entrypoint:**
-- `Downstream Tasks/Property_Prediction.py`
-
-**What it does:**
-- loads a modality-augmented CSV
-- loads pretrained PolyFusion weights
-- trains property heads with K-fold CV
-
 **Run:**
 ```bash
 python "Downstream Tasks/Property_Prediction.py"
 ```
 
-### 5.3 Inverse design / polymer generation
+### 4.3 Inverse Design Generator (SELFIES-TED conditioning)
 
-**Entrypoint:**
-- `Downstream Tasks/Polymer_Generation.py`
+Inverse design conditions a SELFIES-based encoder–decoder (SELFIES-TED) on PolyFusion’s 600-d embedding. Implementation details include:
+- conditioning via **K = 4** learned memory tokens
+- training-time latent noise **σ_train = 0.10**
+- decoding uses top-p (0.92), temperature 1.0, repetition penalty 1.05, max length 256
+- property targeting via generate-then-filter using a Gaussian Process Regression (GPR) oracle and acceptance threshold **τ_s = 0.5** (standardized units)
 
-**What it does:**
-- conditions SELFIES-TED on PolyFusion embeddings
-- generates candidates and filters to target using the manuscript-style oracle loop
+**Save:**
+- decoder weights + conditioning projection
+- tokenization assets
+- property oracle artifacts (GP models / scalers)
 
 **Run:**
 ```bash
 python "Downstream Tasks/Polymer_Generation.py"
 ```
 
-### 5.4 PolyAgent (Gradio UI)
+### 4.4 PolyAgent (Gradio UI)
 
 **Core components:**
 - `PolyAgent/orchestrator.py` (controller + tool router)
@@ -390,38 +343,4 @@ python "Downstream Tasks/Polymer_Generation.py"
 cd PolyAgent
 python gradio_interface.py --server-name 0.0.0.0 --server-port 7860
 ```
-
 ---
-
-## 6. Results & Reproducibility
-
-### 6.1 What “reproducible” means in this repo
-
-To help others reproduce your paper-level results:
-- Pin versions: Python, PyTorch, CUDA, RDKit, FAISS, Transformers
-- Fix seeds across Python/NumPy/Torch
-- Log configs per run (JSON/YAML dumped beside checkpoints)
-- Record dataset snapshots (hashes of CSVs and modality JSON columns)
-
-### 6.2 Manuscript training protocol highlights
-
-- PolyFusion shared latent dimension: **600**
-- Unified corruption: **pmask = 0.15**, **80/10/10 rule**
-- Contrastive alignment uses InfoNCE with **τ = 0.07**
-- Pretraining optimization and schedule: AdamW, lr 1e-4, wd 1e-2, eff batch 64, FP16, early stopping
-- PolyAgent retrieval index: 1108 PDFs; chunking and FAISS HNSW params as described
-
----
-
-## 7. Citation
-
-If you use this repository in your work, please cite the accompanying manuscript:
-
-```bibtex
-@article{kaur2026polyfusionagent,
-  title   = {PolyFusionAgent: a multimodal foundation model and autonomous AI assistant for polymer informatics},
-  author  = {Kaur, Manpreet and Liu, Qian},
-  year    = {2026},
-  note    = {Manuscript / preprint}
-}
-```
