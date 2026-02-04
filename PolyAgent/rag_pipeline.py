@@ -55,7 +55,7 @@ DEFAULT_TMP_DOWNLOAD_DIR = os.path.join(tempfile.gettempdir(), "polymer_rag_pdfs
 MANIFEST_NAME = "manifest.jsonl"
 
 # --------------------------------------------------------------------------------------
-# Balanced target distribution (total ~2000 PDFs)
+# Balanced target distribution
 # --------------------------------------------------------------------------------------
 TARGET_CURATED = 100
 TARGET_JOURNALS = 200
@@ -1052,7 +1052,6 @@ def build_retriever_from_web(
 ):
     """
     Fetch balanced polymer corpus across multiple sources.
-
     Target distribution (~2000 PDFs):
     - Curated guidelines/standards: 100
     - Polymer journals OA: 200
