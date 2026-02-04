@@ -1,6 +1,9 @@
 """
+DeBERTav2.py
 DeBERTaV2 masked language modeling pretraining for polymer SMILES (PSMILES).
 """
+
+from __future__ import annotations
 
 import os
 import time
@@ -8,13 +11,15 @@ import json
 import shutil
 import argparse
 import warnings
-from typing import Optional, List
+from typing import Optional, List, Tuple
 
 warnings.filterwarnings("ignore")
+
 
 def set_cuda_visible_devices(gpu: str = "0") -> None:
     """Set CUDA_VISIBLE_DEVICES before importing torch/transformers heavy modules."""
     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+
 
 def parse_args() -> argparse.Namespace:
     """CLI arguments for paths and key training/data settings."""
@@ -127,13 +132,17 @@ def train_sentencepiece_if_needed(train_txt: str, spm_model_prefix: str, vocab_s
     return model_path
 
 
-def build_tokenizer(spm_model_path: str):
-    """Create a DebertaV2Tokenizer backed by a SentencePiece model."""
+def build_psmiles_tokenizer(spm_path: str, max_len: int = 128):
+    """
+    Uses SentencePiece-backed DebertaV2Tokenizer.
+    """
     from transformers import DebertaV2Tokenizer
 
-    tokenizer = DebertaV2Tokenizer(vocab_file=spm_model_path, do_lower_case=False)
-    tokenizer.add_special_tokens({"pad_token": "<pad>", "mask_token": "<mask>"})
-    return tokenizer
+    tok = DebertaV2Tokenizer(vocab_file=spm_path, do_lower_case=False)
+    tok.add_special_tokens({"pad_token": "<pad>", "mask_token": "<mask>"})
+    # store max_len for convenience (not required by HF)
+    tok.model_max_length = max_len
+    return tok
 
 
 def tokenize_and_save_dataset(train_psmiles: List[str], val_psmiles: List[str], tokenizer, save_dir: str) -> None:
@@ -144,7 +153,7 @@ def tokenize_and_save_dataset(train_psmiles: List[str], val_psmiles: List[str], 
     hf_val = Dataset.from_dict({"text": val_psmiles})
 
     def tokenize_batch(examples):
-        return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=128)
+        return tokenizer(examples["text"], truncation=True, padding="max_length", max_length=tokenizer.model_max_length)
 
     train_tok = hf_train.map(tokenize_batch, batched=True, batch_size=10_000, num_proc=10)
     val_tok = hf_val.map(tokenize_batch, batched=True, batch_size=10_000, num_proc=10)
@@ -169,14 +178,13 @@ def load_tokenized_dataset(tokenized_dir: str):
 
 class EpochMetricsCallback:
     """
-    TrainerCallback that:
+    TrainerCallback wrapper that:
     - Tracks best validation loss
     - Implements early stopping on val_loss with patience
     - Saves best model + tokenizer.model copy
     - Prints epoch-level stats
     """
 
-    # NOTE: We import TrainerCallback lazily to keep module import minimal in helpers.
     def __init__(self, tokenizer_model_path: str, output_dir: str, patience: int = 10):
         from transformers.trainer_callback import TrainerCallback
         from sentencepiece import SentencePieceProcessor
@@ -216,7 +224,6 @@ class EpochMetricsCallback:
         self._last_train_loss = None
 
     def as_trainer_callback(self):
-        """Return an instance that HuggingFace Trainer can register."""
         return self._cb_cls(self)
 
     def _save_model(self, trainer_obj, suffix: str) -> None:
@@ -312,33 +319,166 @@ def compute_metrics(eval_pred):
     preds = np.argmax(masked_logits, axis=-1)
 
     f1 = f1_score(masked_labels, preds, average="weighted")
-    accuracy = np.mean(masked_labels == preds)
+    accuracy = float(np.mean(masked_labels == preds))
     return {"eval_f1": f1, "eval_accuracy": accuracy}
+
+
+# =============================================================================
+# Encoder wrapper for MLM training
+# =============================================================================
+
+class PSMILESDebertaEncoder:
+    """
+    Dual-use wrapper:
+    - For MLM training (HF Trainer):
+        forward(input_ids, attention_mask, labels) -> HF outputs (with .loss, .logits)
+    - token_logits(...) helper for reconstruction 
+    """
+
+    def __init__(
+        self,
+        model_dir_or_name: Optional[str] = None,
+        hidden_size: int = 600,
+        num_hidden_layers: int = 12,
+        num_attention_heads: int = 12,
+        intermediate_size: int = 512,
+        vocab_size: Optional[int] = None,
+        pad_token_id: int = 0,
+        emb_dim: int = 600,
+    ):
+        import torch
+        import torch.nn as nn
+        from transformers import DebertaV2Config, DebertaV2ForMaskedLM
+
+        self.torch = torch
+        self.nn = nn
+
+        if model_dir_or_name is not None:
+            self.model = DebertaV2ForMaskedLM.from_pretrained(model_dir_or_name)
+        else:
+            if vocab_size is None:
+                vocab_size = 265  # fallback; will be resized by caller if tokenizer provided
+            config = DebertaV2Config(
+                vocab_size=vocab_size,
+                hidden_size=hidden_size,
+                num_attention_heads=num_attention_heads,
+                num_hidden_layers=num_hidden_layers,
+                intermediate_size=intermediate_size,
+                pad_token_id=pad_token_id,
+            )
+            self.model = DebertaV2ForMaskedLM(config)
+
+        # Use hidden size from config if available
+        hs = int(getattr(self.model.config, "hidden_size", hidden_size))
+        self.pool_proj = nn.Linear(hs, emb_dim)
+        self._device = None
+
+    # ---- nn.Module-like API ----
+    def to(self, device):
+        self.model.to(device)
+        self.pool_proj.to(device)
+        self._device = device
+        return self
+
+    def train(self, mode: bool = True):
+        self.model.train(mode)
+        self.pool_proj.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
+
+    def parameters(self):
+        for p in self.model.parameters():
+            yield p
+        for p in self.pool_proj.parameters():
+            yield p
+
+    def state_dict(self):
+        sd = {"model": self.model.state_dict(), "pool_proj": self.pool_proj.state_dict()}
+        return sd
+
+    def load_state_dict(self, state_dict, strict: bool = False):
+        if isinstance(state_dict, dict) and "model" in state_dict and "pool_proj" in state_dict:
+            self.model.load_state_dict(state_dict["model"], strict=strict)
+            self.pool_proj.load_state_dict(state_dict["pool_proj"], strict=strict)
+        else:
+            # allow loading a raw HF state_dict (best-effort)
+            try:
+                self.model.load_state_dict(state_dict, strict=strict)
+            except Exception:
+                # ignore if incompatible
+                pass
+        return self
+
+    def __call__(self, input_ids, attention_mask=None, labels=None):
+        return self.forward(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+    # ---- Core helpers ----
+    def _pool_hidden(self, last_hidden_state, attention_mask=None):
+        """
+        Pool token embeddings -> sequence embedding.
+        Use attention-masked mean pooling (robust).
+        """
+        import torch
+
+        if attention_mask is None:
+            return last_hidden_state.mean(dim=1)
+
+        mask = attention_mask.to(last_hidden_state.device).unsqueeze(-1).float()
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        pooled = (last_hidden_state * mask).sum(dim=1) / denom
+        return pooled
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        """
+        If labels is provided -> MLM mode: return HF outputs (Trainer compatible).
+        Else -> encoder mode: return pooled embedding.
+        """
+        if labels is not None:
+            return self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+
+        out = self.model.deberta(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        last_hidden = out.last_hidden_state
+        pooled = self._pool_hidden(last_hidden, attention_mask=attention_mask)
+        return self.pool_proj(pooled)
+
+    def token_logits(self, input_ids, attention_mask=None, labels=None):
+        """
+        - If labels provided: returns loss tensor from HF MLM forward
+        - Else: returns token logits (B, L, V)
+        """
+        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+        if labels is not None:
+            return outputs.loss
+        return outputs.logits
 
 
 def build_model_and_trainer(tokenizer, dataset_train, dataset_test, spm_model_path: str, output_dir: str):
     """Construct model, training args, callback, and Trainer."""
     import torch
-    import numpy as np
-    from transformers import DebertaV2Config, DebertaV2ForMaskedLM, Trainer, TrainingArguments
-    from transformers import DataCollatorForLanguageModeling
+    from transformers import Trainer, TrainingArguments, DataCollatorForLanguageModeling
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
 
     vocab_size = len(tokenizer)
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
-    config = DebertaV2Config(
+    model = PSMILESDebertaEncoder(
+        model_dir_or_name=None,
         vocab_size=vocab_size,
+        pad_token_id=pad_token_id,
         hidden_size=600,
         num_attention_heads=12,
         num_hidden_layers=12,
         intermediate_size=512,
-        pad_token_id=pad_token_id,
+        emb_dim=600,
     )
-
-    model = DebertaV2ForMaskedLM(config)
-    model.resize_token_embeddings(len(tokenizer))
+    # resize HF embeddings
+    try:
+        model.model.resize_token_embeddings(len(tokenizer))
+    except Exception:
+        pass
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model.to(device)
@@ -351,7 +491,7 @@ def build_model_and_trainer(tokenizer, dataset_train, dataset_test, spm_model_pa
         per_device_eval_batch_size=8,
         eval_accumulation_steps=1000,
         gradient_accumulation_steps=4,
-        eval_strategy="epoch",  # kept exactly as provided
+        eval_strategy="epoch",
         logging_strategy="steps",
         logging_steps=500,
         logging_first_step=True,
@@ -364,8 +504,9 @@ def build_model_and_trainer(tokenizer, dataset_train, dataset_test, spm_model_pa
     )
 
     callback_wrapper = EpochMetricsCallback(tokenizer_model_path=spm_model_path, output_dir=output_dir, patience=10)
+
     trainer = Trainer(
-        model=model,
+        model=model,  # wrapper is Trainer-compatible
         args=training_args,
         train_dataset=dataset_train,
         eval_dataset=dataset_test,
@@ -373,26 +514,21 @@ def build_model_and_trainer(tokenizer, dataset_train, dataset_test, spm_model_pa
         compute_metrics=compute_metrics,
         callbacks=[callback_wrapper.as_trainer_callback()],
     )
-
     callback_wrapper.trainer_ref = trainer
     return model, trainer, callback_wrapper
 
 
 def run_training(csv_file: str, nrows: int, train_txt: str, spm_prefix: str, tokenized_dir: str, output_dir: str) -> None:
     """End-to-end: load data, train tokenizer (if needed), tokenize, train model, print final report."""
-    import torch
-
     psmiles_list = load_psmiles_from_csv(csv_file, nrows=nrows)
     train_psmiles, val_psmiles = train_val_split(psmiles_list, test_size=0.2, random_state=42)
 
     write_sentencepiece_training_text(train_psmiles, train_txt)
     spm_model_path = train_sentencepiece_if_needed(train_txt, spm_prefix, vocab_size=265)
 
-    tokenizer = build_tokenizer(spm_model_path)
+    tokenizer = build_psmiles_tokenizer(spm_path=spm_model_path, max_len=128)
 
-    # Tokenize and save dataset
     tokenize_and_save_dataset(train_psmiles, val_psmiles, tokenizer, tokenized_dir)
-
     dataset_train, dataset_test = load_tokenized_dataset(tokenized_dir)
 
     model, trainer, callback = build_model_and_trainer(
@@ -408,6 +544,10 @@ def run_training(csv_file: str, nrows: int, train_txt: str, spm_prefix: str, tok
     total_time = time.time() - start_time
 
     # Final report
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    non_trainable_params = total_params - trainable_params
+
     print(f"\n=== Final Results ===")
     print(f"Total Training Time (s): {total_time:.2f}")
     print(f"Best Validation Loss: {callback.best_val_loss:.4f}")
@@ -415,11 +555,10 @@ def run_training(csv_file: str, nrows: int, train_txt: str, spm_prefix: str, tok
     print(f"Best Validation Accuracy: {callback.best_val_accuracy:.4f}" if callback.best_val_accuracy is not None else "Best Validation Accuracy: None")
     print(f"Best Perplexity: {callback.best_perplexity:.2f}" if callback.best_perplexity is not None else "Best Perplexity: None")
     print(f"Best Model Epoch: {int(callback.best_epoch)}")
-    print(f"Final Training Loss: {train_output.training_loss:.4f}")
-
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    non_trainable_params = total_params - trainable_params
+    try:
+        print(f"Final Training Loss: {train_output.training_loss:.4f}")
+    except Exception:
+        pass
     print(f"Total Parameters: {total_params}")
     print(f"Trainable Parameters: {trainable_params}")
     print(f"Non-trainable Parameters: {non_trainable_params}")
