@@ -1,6 +1,9 @@
 """
+Transformer.py
 Fingerprint masked language modeling (MLM) using a Transformer encoder.
 """
+
+from __future__ import annotations
 
 import os
 import json
@@ -8,7 +11,7 @@ import time
 import sys
 import csv
 import argparse
-from typing import List
+from typing import List, Optional
 
 # Increase max CSV field size limit (fingerprints can be long)
 csv.field_size_limit(sys.maxsize)
@@ -130,6 +133,7 @@ def load_fingerprints(csv_path: str, target_rows: int, chunksize: int) -> List[L
 
 class FingerprintDataset(Dataset):
     """Dataset of fixed-length fingerprint bit vectors (stored as torch.long tensors)."""
+
     def __init__(self, fps: List[torch.Tensor]):
         self.fps = fps
 
@@ -150,8 +154,8 @@ def collate_batch(batch):
     B = len(batch)
     if B == 0:
         return {
-            "z": torch.zeros((0, FP_LENGTH), dtype=torch.long),
-            "labels_z": torch.zeros((0, FP_LENGTH), dtype=torch.long),
+            "input_ids": torch.zeros((0, FP_LENGTH), dtype=torch.long),
+            "labels": torch.zeros((0, FP_LENGTH), dtype=torch.long),
             "attention_mask": torch.zeros((0, FP_LENGTH), dtype=torch.bool),
         }
 
@@ -159,35 +163,11 @@ def collate_batch(batch):
     for item in batch:
         if isinstance(item, torch.Tensor):
             tensors.append(item)
-        elif isinstance(item, dict):
-            if "fp" in item:
-                val = item["fp"]
-                if not isinstance(val, torch.Tensor):
-                    val = torch.tensor(val, dtype=torch.long)
-                tensors.append(val)
-            else:
-                found = None
-                for v in item.values():
-                    if isinstance(v, torch.Tensor):
-                        found = v
-                        break
-                    elif isinstance(v, np.ndarray):
-                        found = torch.tensor(v, dtype=torch.long)
-                        break
-                    elif isinstance(v, list):
-                        try:
-                            found = torch.tensor(v, dtype=torch.long)
-                            break
-                        except Exception:
-                            continue
-                if found is None:
-                    raise KeyError(f"collate_batch: couldn't find tensor-like fp in item keys: {list(item.keys())}")
-                tensors.append(found)
         else:
             tensors.append(torch.tensor(item, dtype=torch.long))
 
     all_inputs = torch.stack(tensors, dim=0).long()
-    labels_z = torch.full_like(all_inputs, fill_value=-100, dtype=torch.long)
+    labels = torch.full_like(all_inputs, fill_value=-100, dtype=torch.long)
     z_masked = all_inputs.clone()
 
     for i in range(B):
@@ -199,7 +179,7 @@ def collate_batch(batch):
 
         sel_idx = torch.nonzero(is_selected).squeeze(-1)
         if sel_idx.numel() > 0:
-            labels_z[i, sel_idx] = z[sel_idx]
+            labels[i, sel_idx] = z[sel_idx]
 
             probs = torch.rand(sel_idx.size(0))
             mask_choice = probs < 0.8
@@ -212,14 +192,22 @@ def collate_batch(batch):
                 z_masked[i, sel_idx[rand_choice]] = rand_bits
 
     attention_mask = torch.ones_like(all_inputs, dtype=torch.bool)
-    return {"z": z_masked, "labels_z": labels_z, "attention_mask": attention_mask}
+    return {"input_ids": z_masked, "labels": labels, "attention_mask": attention_mask}
 
 
 class FingerprintEncoder(nn.Module):
     """Transformer encoder over a length-FP_LENGTH token sequence with small vocab {0,1,MASK}."""
-    def __init__(self, vocab_size=VOCAB_SIZE, hidden_dim=HIDDEN_DIM, seq_len=FP_LENGTH,
-                 num_layers=TRANSFORMER_NUM_LAYERS, nhead=TRANSFORMER_NHEAD, dim_feedforward=TRANSFORMER_FF,
-                 dropout=DROPOUT):
+
+    def __init__(
+        self,
+        vocab_size=VOCAB_SIZE,
+        hidden_dim=HIDDEN_DIM,
+        seq_len=FP_LENGTH,
+        num_layers=TRANSFORMER_NUM_LAYERS,
+        nhead=TRANSFORMER_NHEAD,
+        dim_feedforward=TRANSFORMER_FF,
+        dropout=DROPOUT,
+    ):
         super().__init__()
         self.token_emb = nn.Embedding(vocab_size, hidden_dim)
         self.pos_emb = nn.Embedding(seq_len, hidden_dim)
@@ -242,31 +230,73 @@ class FingerprintEncoder(nn.Module):
         return self.transformer(x, src_key_padding_mask=key_padding_mask)
 
 
-class MaskedFingerprintModel(nn.Module):
-    """Encoder + token classification head; returns scalar loss when labels_z provided."""
-    def __init__(self, hidden_dim=HIDDEN_DIM, vocab_size=VOCAB_SIZE):
+# =============================================================================
+# Wrapper used for MLM training
+# =============================================================================
+
+class PooledFingerprintEncoder(nn.Module):
+    """
+    Dual-use:
+      - labels is None -> return pooled embedding (B, emb_dim)
+      - labels provided -> return loss scalar [Trainer-compatible MLM]
+    Also provides token_logits(...) used for reconstruction.
+    """
+
+    def __init__(
+        self,
+        vocab_size=VOCAB_SIZE,
+        hidden_dim=HIDDEN_DIM,
+        seq_len=FP_LENGTH,
+        num_layers=TRANSFORMER_NUM_LAYERS,
+        nhead=TRANSFORMER_NHEAD,
+        dim_feedforward=TRANSFORMER_FF,
+        dropout=DROPOUT,
+        emb_dim: int = 600,
+    ):
         super().__init__()
-        self.encoder = FingerprintEncoder(vocab_size=vocab_size, hidden_dim=hidden_dim)
+        self.encoder = FingerprintEncoder(
+            vocab_size=vocab_size,
+            hidden_dim=hidden_dim,
+            seq_len=seq_len,
+            num_layers=num_layers,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+        )
         self.mlm_head = nn.Linear(hidden_dim, vocab_size)
+        self.pool_proj = nn.Linear(hidden_dim, emb_dim)
 
-    def forward(self, z, attention_mask=None, labels_z=None):
-        embeddings = self.encoder(z, attention_mask=attention_mask)
-        logits = self.mlm_head(embeddings)
+    def _pool(self, h, attention_mask=None):
+        if attention_mask is None:
+            return h.mean(dim=1)
+        mask = attention_mask.unsqueeze(-1).float()
+        denom = mask.sum(dim=1).clamp(min=1.0)
+        return (h * mask).sum(dim=1) / denom
 
-        if labels_z is not None:
-            mask = labels_z != -100
+    def token_logits(self, input_ids, attention_mask=None):
+        h = self.encoder(input_ids, attention_mask=attention_mask)
+        return self.mlm_head(h)
+
+    def forward(self, input_ids, attention_mask=None, labels=None):
+        logits = self.token_logits(input_ids, attention_mask=attention_mask)
+
+        if labels is not None:
+            mask = labels != -100
             if mask.sum() == 0:
-                return torch.tensor(0.0, device=z.device)
-
+                return torch.tensor(0.0, device=input_ids.device)
             logits_masked = logits[mask]
-            labels_masked = labels_z[mask].long()
+            labels_masked = labels[mask].long()
             return F.cross_entropy(logits_masked, labels_masked)
 
-        return logits
+        # pooled embedding for CL
+        h = self.encoder(input_ids, attention_mask=attention_mask)
+        pooled = self._pool(h, attention_mask=attention_mask)
+        return self.pool_proj(pooled)
 
 
 class ValLossCallback(TrainerCallback):
     """Tracks best eval loss, prints metrics, saves best model, early-stops."""
+
     def __init__(self, best_model_dir: str, val_loader: DataLoader, patience: int = 10, trainer_ref=None):
         self.best_val_loss = float("inf")
         self.epochs_no_improve = 0
@@ -301,12 +331,12 @@ class ValLossCallback(TrainerCallback):
 
         with torch.no_grad():
             for batch in self.val_loader:
-                z = batch["z"].to(device_local)
-                labels_z = batch["labels_z"].to(device_local)
-                attention_mask = batch.get("attention_mask", torch.ones_like(z, dtype=torch.bool)).to(device_local)
+                input_ids = batch["input_ids"].to(device_local)
+                labels = batch["labels"].to(device_local)
+                attention_mask = batch.get("attention_mask", torch.ones_like(input_ids, dtype=torch.bool)).to(device_local)
 
                 try:
-                    loss = model_eval(z, attention_mask=attention_mask, labels_z=labels_z)
+                    loss = model_eval(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
                 except Exception:
                     loss = None
 
@@ -314,17 +344,16 @@ class ValLossCallback(TrainerCallback):
                     total_loss += loss.item()
                     n_batches += 1
 
-                logits = model_eval(z, attention_mask=attention_mask)
-
-                mask = labels_z != -100
+                logits = model_eval.token_logits(input_ids=input_ids, attention_mask=attention_mask)
+                mask = labels != -100
                 if mask.sum().item() == 0:
                     continue
 
                 logits_masked_list.append(logits[mask])
-                labels_masked_list.append(labels_z[mask])
+                labels_masked_list.append(labels[mask])
 
                 pred_bits = torch.argmax(logits[mask], dim=-1)
-                true_b = labels_z[mask]
+                true_b = labels[mask]
 
                 preds_bits.extend(pred_bits.cpu().tolist())
                 true_bits.extend(true_b.cpu().tolist())
@@ -379,25 +408,37 @@ def train_and_eval(args: argparse.Namespace) -> None:
     train_fps = [torch.tensor(fp_lists[i], dtype=torch.long) for i in train_idx]
     val_fps = [torch.tensor(fp_lists[i], dtype=torch.long) for i in val_idx]
 
-    # Compute class weights
-    counts = np.ones((2,), dtype=np.float64)
-    for fp in train_fps:
-        vals = fp.cpu().numpy().astype(int)
-        counts[0] += np.sum(vals == 0)
-        counts[1] += np.sum(vals == 1)
-    freq = counts / counts.sum()
-    inv_freq = 1.0 / (freq + 1e-12)
-    class_weights_arr = inv_freq / inv_freq.mean()
-    class_weights = torch.tensor(class_weights_arr, dtype=torch.float)
-    print("Class weights (for bit 0 and bit 1):", class_weights.numpy())
-
     train_dataset = FingerprintDataset(train_fps)
     val_dataset = FingerprintDataset(val_fps)
 
-    train_loader = DataLoader(train_dataset, batch_size=TRAIN_BATCH_SIZE, shuffle=True, collate_fn=collate_batch, drop_last=False, num_workers=args.num_workers)
-    val_loader = DataLoader(val_dataset, batch_size=EVAL_BATCH_SIZE, shuffle=False, collate_fn=collate_batch, drop_last=False, num_workers=args.num_workers)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=TRAIN_BATCH_SIZE,
+        shuffle=True,
+        collate_fn=collate_batch,
+        drop_last=False,
+        num_workers=args.num_workers,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=EVAL_BATCH_SIZE,
+        shuffle=False,
+        collate_fn=collate_batch,
+        drop_last=False,
+        num_workers=args.num_workers,
+    )
 
-    model = MaskedFingerprintModel(hidden_dim=HIDDEN_DIM, vocab_size=VOCAB_SIZE)
+    model = PooledFingerprintEncoder(
+        vocab_size=VOCAB_SIZE,
+        hidden_dim=HIDDEN_DIM,
+        seq_len=FP_LENGTH,
+        num_layers=TRANSFORMER_NUM_LAYERS,
+        nhead=TRANSFORMER_NHEAD,
+        dim_feedforward=TRANSFORMER_FF,
+        dropout=DROPOUT,
+        emb_dim=600,
+    )
+
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
@@ -451,21 +492,21 @@ def train_and_eval(args: argparse.Namespace) -> None:
 
     with torch.no_grad():
         for batch in val_loader:
-            z = batch["z"].to(device)
-            labels_z = batch["labels_z"].to(device)
-            attention_mask = batch.get("attention_mask", torch.ones_like(z, dtype=torch.bool)).to(device)
+            input_ids = batch["input_ids"].to(device)
+            labels = batch["labels"].to(device)
+            attention_mask = batch.get("attention_mask", torch.ones_like(input_ids, dtype=torch.bool)).to(device)
 
-            logits = model(z, attention_mask=attention_mask)
+            logits = model.token_logits(input_ids=input_ids, attention_mask=attention_mask)
 
-            mask = labels_z != -100
+            mask = labels != -100
             if mask.sum().item() == 0:
                 continue
 
             logits_masked_final.append(logits[mask])
-            labels_masked_final.append(labels_z[mask])
+            labels_masked_final.append(labels[mask])
 
             pred_bits = torch.argmax(logits[mask], dim=-1)
-            true_b = labels_z[mask]
+            true_b = labels[mask]
 
             preds_bits_all.extend(pred_bits.cpu().tolist())
             true_bits_all.extend(true_b.cpu().tolist())
