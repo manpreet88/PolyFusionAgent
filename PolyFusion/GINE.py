@@ -1,6 +1,9 @@
 """
-GINE-based masked pretraining on polymer graphs.
+GINE.py
+GINE-based masked pretraining on polymer 2D graphs.
 """
+
+from __future__ import annotations
 
 import os
 import json
@@ -278,8 +281,127 @@ def compute_class_weights(train_atomic: List[torch.Tensor]) -> torch.Tensor:
     return class_weights
 
 
+# =============================================================================
+# Encoder wrapper used by MaskedGINE
+# =============================================================================
+
+class GineBlock(nn.Module):
+    """One GINEConv block (MLP + BN + ReLU)."""
+
+    def __init__(self, node_dim: int):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.Linear(node_dim, node_dim), nn.ReLU(), nn.Linear(node_dim, node_dim))
+        self.conv = GINEConv(self.mlp)
+        self.bn = nn.BatchNorm1d(node_dim)
+        self.act = nn.ReLU()
+
+    def forward(self, x, edge_index, edge_attr):
+        x = self.conv(x, edge_index, edge_attr)
+        x = self.bn(x)
+        x = self.act(x)
+        return x
+
+
+class GineEncoder(nn.Module):
+    """
+    Graph encoder:
+    - Produces node embeddings via GINE
+    - Provides pooled graph embedding via mean pooling + pool_proj
+    - Provides node_logits(...) for reconstruction (atomic prediction head)
+    """
+
+    def __init__(
+        self,
+        node_emb_dim: int = NODE_EMB_DIM,
+        edge_emb_dim: int = EDGE_EMB_DIM,
+        num_layers: int = NUM_GNN_LAYERS,
+        max_atomic_z: int = MAX_ATOMIC_Z,
+        emb_dim: int = 600,
+        class_weights: Optional[torch.Tensor] = None,
+    ):
+        super().__init__()
+        self.node_emb_dim = node_emb_dim
+        self.edge_emb_dim = edge_emb_dim
+        self.max_atomic_z = max_atomic_z
+
+        num_embeddings = MASK_ATOM_ID + 1
+        self.atom_emb = nn.Embedding(num_embeddings=num_embeddings, embedding_dim=node_emb_dim, padding_idx=None)
+
+        self.node_attr_proj = nn.Sequential(nn.Linear(2, node_emb_dim), nn.ReLU(), nn.Linear(node_emb_dim, node_emb_dim))
+        self.edge_encoder = nn.Sequential(nn.Linear(3, edge_emb_dim), nn.ReLU(), nn.Linear(edge_emb_dim, edge_emb_dim))
+        self._edge_to_node_proj = nn.Linear(edge_emb_dim, node_emb_dim) if edge_emb_dim != node_emb_dim else None
+
+        self.gnn_layers = nn.ModuleList([GineBlock(node_emb_dim) for _ in range(num_layers)])
+
+        # node head for masked-atom reconstruction 
+        self.atom_head = nn.Linear(node_emb_dim, MASK_ATOM_ID + 1)
+
+        # pooled embedding projection 
+        self.pool_proj = nn.Linear(node_emb_dim, emb_dim)
+
+        if class_weights is not None:
+            self.register_buffer("class_weights", class_weights)
+        else:
+            self.class_weights = None
+
+    def encode_nodes(self, z, chirality, formal_charge, edge_index, edge_attr):
+        if z.numel() == 0:
+            return torch.zeros((0, self.node_emb_dim), device=z.device)
+
+        atom_embedding = self.atom_emb(z)
+        node_attr = torch.stack([chirality, formal_charge], dim=1)
+        node_attr_emb = self.node_attr_proj(node_attr.to(atom_embedding.device))
+        x = atom_embedding + node_attr_emb
+
+        if edge_attr is None or edge_attr.numel() == 0:
+            edge_emb = torch.zeros((0, self.edge_emb_dim), dtype=torch.float, device=x.device)
+        else:
+            edge_emb = self.edge_encoder(edge_attr.to(x.device))
+
+        edge_for_conv = self._edge_to_node_proj(edge_emb) if self._edge_to_node_proj is not None else edge_emb
+
+        h = x
+        for layer in self.gnn_layers:
+            h = layer(h, edge_index.to(h.device), edge_for_conv)
+        return h
+
+    def node_logits(self, z, chirality, formal_charge, edge_index, edge_attr, batch=None):
+        h = self.encode_nodes(z, chirality, formal_charge, edge_index, edge_attr)
+        return self.atom_head(h)
+
+    def forward(self, z, chirality, formal_charge, edge_index, edge_attr, batch=None):
+        """
+        Returns pooled graph embedding (B, emb_dim).
+        Pool = mean over nodes per graph (batch vector).
+        """
+        if batch is None:
+            batch = torch.zeros(z.size(0), dtype=torch.long, device=z.device)
+
+        h = self.encode_nodes(z, chirality, formal_charge, edge_index, edge_attr)
+
+        if h.size(0) == 0:
+            # no nodes: return empty batch
+            B = int(batch.max().item() + 1) if batch.numel() > 0 else 0
+            return torch.zeros((B, self.pool_proj.out_features), device=z.device)
+
+        B = int(batch.max().item() + 1) if batch.numel() > 0 else 1
+        pooled = torch.zeros((B, h.size(1)), device=h.device)
+        counts = torch.zeros((B,), device=h.device).clamp(min=0.0)
+
+        pooled.index_add_(0, batch, h)
+        ones = torch.ones((h.size(0),), device=h.device)
+        counts.index_add_(0, batch, ones)
+        pooled = pooled / counts.clamp(min=1.0).unsqueeze(-1)
+        return self.pool_proj(pooled)
+
+
+# =============================================================================
+# Training dataset + collate
+# =============================================================================
+
 class PolymerDataset(Dataset):
     """Holds per-graph tensors; collation builds a single batched graph with masking targets."""
+
     def __init__(self, atomic_list, chirality_list, charge_list, edge_index_list, edge_attr_list, num_nodes_list):
         self.atomic_list = atomic_list
         self.chirality_list = chirality_list
@@ -349,7 +471,7 @@ def collate_batch(batch):
             if rand_choice.any():
                 z_masked[sel_idx[rand_choice]] = rand_atomic[rand_choice]
 
-        # Hop-distance targets for masked atoms (anchors = nearest visible nodes in hop distance)
+        # Hop-distance targets for masked atoms
         visible_idx = torch.nonzero(~is_selected).squeeze(-1)
         if visible_idx.numel() == 0:
             visible_idx = torch.arange(n, dtype=torch.long)
@@ -426,21 +548,9 @@ def collate_batch(batch):
     }
 
 
-class GineBlock(nn.Module):
-    """One GINEConv block (MLP + BN + ReLU)."""
-    def __init__(self, node_dim: int):
-        super().__init__()
-        self.mlp = nn.Sequential(nn.Linear(node_dim, node_dim), nn.ReLU(), nn.Linear(node_dim, node_dim))
-        self.conv = GINEConv(self.mlp)
-        self.bn = nn.BatchNorm1d(node_dim)
-        self.act = nn.ReLU()
-
-    def forward(self, x, edge_index, edge_attr):
-        x = self.conv(x, edge_index, edge_attr)
-        x = self.bn(x)
-        x = self.act(x)
-        return x
-
+# =============================================================================
+# Masked pretraining model
+# =============================================================================
 
 class MaskedGINE(nn.Module):
     """
@@ -449,24 +559,28 @@ class MaskedGINE(nn.Module):
       - predict hop-distance anchors for masked nodes (regression head)
       - optionally learned uncertainty weighting across the two losses
     """
-    def __init__(self, node_emb_dim=NODE_EMB_DIM, edge_emb_dim=EDGE_EMB_DIM, num_layers=NUM_GNN_LAYERS,
-                 max_atomic_z=MAX_ATOMIC_Z, class_weights=None):
+
+    def __init__(
+        self,
+        node_emb_dim=NODE_EMB_DIM,
+        edge_emb_dim=EDGE_EMB_DIM,
+        num_layers=NUM_GNN_LAYERS,
+        max_atomic_z=MAX_ATOMIC_Z,
+        class_weights=None,
+    ):
         super().__init__()
-        self.node_emb_dim = node_emb_dim
-        self.edge_emb_dim = edge_emb_dim
-        self.max_atomic_z = max_atomic_z
+        # Use GineEncoder internally
+        self.encoder = GineEncoder(
+            node_emb_dim=node_emb_dim,
+            edge_emb_dim=edge_emb_dim,
+            num_layers=num_layers,
+            max_atomic_z=max_atomic_z,
+            emb_dim=600,
+            class_weights=class_weights,
+        )
 
-        num_embeddings = MASK_ATOM_ID + 1
-        self.atom_emb = nn.Embedding(num_embeddings=num_embeddings, embedding_dim=node_emb_dim, padding_idx=None)
-
-        self.node_attr_proj = nn.Sequential(nn.Linear(2, node_emb_dim), nn.ReLU(), nn.Linear(node_emb_dim, node_emb_dim))
-        self.edge_encoder = nn.Sequential(nn.Linear(3, edge_emb_dim), nn.ReLU(), nn.Linear(edge_emb_dim, edge_emb_dim))
-
-        self._edge_to_node_proj = nn.Linear(edge_emb_dim, node_emb_dim) if edge_emb_dim != node_emb_dim else None
-
-        self.gnn_layers = nn.ModuleList([GineBlock(node_emb_dim) for _ in range(num_layers)])
-
-        self.atom_head = nn.Linear(node_emb_dim, MASK_ATOM_ID + 1)
+        # reuse same heads conceptually:
+        # encoder has atom_head already; we add hop-distance head here
         self.coord_head = nn.Linear(node_emb_dim, K_ANCHORS)
 
         if USE_LEARNED_WEIGHTING:
@@ -476,33 +590,28 @@ class MaskedGINE(nn.Module):
             self.log_var_z = None
             self.log_var_pos = None
 
-        if class_weights is not None:
-            self.register_buffer("class_weights", class_weights)
-        else:
-            self.class_weights = None
+        # class_weights 
+        self.class_weights = getattr(self.encoder, "class_weights", None)
 
-    def forward(self, z, chirality, formal_charge, edge_index, edge_attr, batch=None,
-                labels_z=None, labels_dists=None, labels_dists_mask=None):
+    def forward(
+        self,
+        z,
+        chirality,
+        formal_charge,
+        edge_index,
+        edge_attr,
+        batch=None,
+        labels_z=None,
+        labels_dists=None,
+        labels_dists_mask=None,
+    ):
         if batch is None:
             batch = torch.zeros(z.size(0), dtype=torch.long, device=z.device)
 
-        atom_embedding = self.atom_emb(z)
-        node_attr = torch.stack([chirality, formal_charge], dim=1)
-        node_attr_emb = self.node_attr_proj(node_attr.to(atom_embedding.device))
-        x = atom_embedding + node_attr_emb
+        # node embeddings
+        h = self.encoder.encode_nodes(z, chirality, formal_charge, edge_index, edge_attr)
 
-        if edge_attr is None or edge_attr.numel() == 0:
-            edge_emb = torch.zeros((0, self.edge_emb_dim), dtype=torch.float, device=x.device)
-        else:
-            edge_emb = self.edge_encoder(edge_attr.to(x.device))
-
-        edge_for_conv = self._edge_to_node_proj(edge_emb) if self._edge_to_node_proj is not None else edge_emb
-
-        h = x
-        for layer in self.gnn_layers:
-            h = layer(h, edge_index.to(h.device), edge_for_conv)
-
-        logits = self.atom_head(h)
+        logits = self.encoder.atom_head(h)
         dists_pred = self.coord_head(h)
 
         if labels_z is not None and labels_dists is not None and labels_dists_mask is not None:
@@ -518,7 +627,9 @@ class MaskedGINE(nn.Module):
 
             if self.class_weights is not None:
                 loss_z = F.cross_entropy(
-                    logits_masked, labels_z_masked.to(logits_masked.device), weight=self.class_weights.to(logits_masked.device)
+                    logits_masked,
+                    labels_z_masked.to(logits_masked.device),
+                    weight=self.class_weights.to(logits_masked.device),
                 )
             else:
                 loss_z = F.cross_entropy(logits_masked, labels_z_masked.to(logits_masked.device))
@@ -542,6 +653,7 @@ class MaskedGINE(nn.Module):
 
 class ValLossCallback(TrainerCallback):
     """Evaluation callback: prints metrics, saves best model, and early-stops on val loss."""
+
     def __init__(self, best_model_dir: str, val_loader: DataLoader, patience: int = 10, trainer_ref=None):
         self.best_val_loss = float("inf")
         self.epochs_no_improve = 0
