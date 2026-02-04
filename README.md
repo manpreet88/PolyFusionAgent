@@ -56,7 +56,7 @@ PolyAgent closes the design loop by coupling prediction and inverse design to ev
   - [4.2 Downstream Predictors (property regression)](#42-downstream-predictors-property-regression)
   - [4.3 Inverse Design Generator (SELFIES-TED conditioning)](#43-inverse-design-generator-selfies-ted-conditioning)
   - [4.4 PolyAgent (Gradio UI)](#44-polyagent-gradio-ui)
-
+- [5.Pretraining Weights / PolyAgent UI](#5-pretraining-weights-polyagent-ui)
 ---
 
 ## 1. Repository Overview
@@ -218,14 +218,14 @@ export HF_TOKEN="YOUR_HF_TOKEN"   # Baseline LLMs
 ### 3.1 Datasets
 This repo is designed to work with large-scale pretraining corpora (for PolyFusion at two scales: 2M and 5M) plus experiment-backed downstream sets (for finetuning/evaluation). It does not redistribute these datasets—please download them from the original sources and follow their licenses/terms.
 
-**Pretraining corpora (examples used in the paper):**
+**Pretraining corpora:**
 - **PI1M:** “PI1M: A Benchmark Database for Polymer Informatics.”  
   DOI page: https://pubs.acs.org/doi/10.1021/acs.jcim.0c00726  
   (Often mirrored/linked via PubMed)
 - **polyOne:** “polyOne Data Set – 100 million hypothetical polymers …” (Zenodo record).  
   Zenodo: https://zenodo.org/records/7766806
 
-**Downstream / evaluation data (example):**
+**Downstream / evaluation data:**
 - **PoLyInfo (NIMS Polymer Database)** provides experimental/literature polymer properties and metadata.  
   Main site: https://polymer.nims.go.jp/en/  
   Overview/help: https://polymer.nims.go.jp/PoLyInfo/guide/en/what_is_polyinfo.html
@@ -341,11 +341,12 @@ python "Downstream Tasks/Polymer_Generation.py"
 **Run:**
 ```bash
 cd PolyAgent
+python rag_pipeline.py
 python gradio_interface.py --server-name 0.0.0.0 --server-port 7860
 ```
 ---
 
-### Pretraining Weights / PolyAgent UI
+## 5. Pretraining Weights / PolyAgent UI
 
 All pretrained checkpoints, tokenizers, and downstream heads are versioned in the PolyFusionAgent weights repository:
 
