@@ -17,6 +17,15 @@
 
 ---
 
+---
+
+## Links 
+- **Live Space:** [kaurm43/PolyFusionAgent](https://huggingface.co/spaces/kaurm43/PolyFusionAgent)
+- **Weights repo:** [kaurm43/polyfusionagent-weights](https://huggingface.co/kaurm43/polyfusionagent-weights)
+- **Weights file browser:** [weights/tree/main](https://huggingface.co/kaurm43/polyfusionagent-weights/tree/main)
+
+---
+
 ## Abstract
 
 Polymers underpin technologies from energy storage to biomedicine, yet discovery remains constrained by an astronomically large design space and fragmented representations of polymer structure, properties, and prior knowledge. Although machine learning has advanced property prediction and candidate generation, most models remain disconnected from the physical and experimental context needed for actionable materials design.
