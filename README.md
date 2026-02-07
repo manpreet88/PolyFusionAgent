@@ -9,7 +9,7 @@
 
 ## Authors & Affiliation
 
-**M Kaur**¹, **Q Liu**¹*  
+**M Kaur**, **Q Liu**
 
 ---
 
