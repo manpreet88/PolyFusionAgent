@@ -7,12 +7,6 @@
 
 ---
 
-## Authors & Affiliation
-
-**M Kaur**, **Q Liu**
-
----
-
 ## Links 
 - **Live Space:** [kaurm43/PolyFusionAgent](https://huggingface.co/spaces/kaurm43/PolyFusionAgent)
 - **Weights repo:** [kaurm43/polyfusionagent-weights](https://huggingface.co/kaurm43/polyfusionagent-weights)
