@@ -9,11 +9,7 @@
 
 ## Authors & Affiliation
 
-**Manpreet Kaur**¹, **Qian Liu**¹*  
-¹ Department of Applied Computer Science, The University of Winnipeg, Winnipeg, MB, Canada
-
-### Contact
-- **Qian Liu** — qi.liu@uwinnipeg.ca
+**M Kaur**¹, **Q Liu**¹*  
 
 ---
 
